@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "CodexTools": {
+      "command": "D:/python/CodexTools/.venv/Scripts/python.exe",
+      "args": ["-u", "-X", "utf8", "D:/python/CodexTools/server.py"]
+    }
+  }
+}

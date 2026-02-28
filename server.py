@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
 
 SERVER_NAME = "CodexTools"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.7.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -77,6 +77,802 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 def _path(path_text: str) -> Path:
     return Path(path_text).expanduser().resolve()
+
+
+STATE_ROOT = Path(__file__).resolve().parent / ".agent" / "state"
+CONTROL_STATE_PATH = STATE_ROOT / "codextools_control_state.json"
+CHANGE_SNAPSHOT_ROOT = STATE_ROOT / "change_snapshots"
+
+PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "blocked", "canceled"}
+GIT_CHANGE_REF_PREFIX = "refs/codextools/baselines"
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ensure_control_paths() -> None:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    CHANGE_SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _default_control_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "next_plan_seq": 1,
+        "plans": {},
+        "plan_order": [],
+        "next_change_seq": 1,
+        "changes": {},
+        "change_order": [],
+        "active_change_id": None,
+    }
+
+
+def _load_control_state() -> dict[str, Any]:
+    _ensure_control_paths()
+    if not CONTROL_STATE_PATH.exists():
+        return _default_control_state()
+
+    try:
+        loaded = json.loads(CONTROL_STATE_PATH.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(loaded, dict):
+            raise ValueError("state root must be object")
+    except Exception as e:
+        _log(f"state load failed, using defaults: {e}")
+        return _default_control_state()
+
+    state = _default_control_state()
+    for key in state.keys():
+        if key in loaded:
+            state[key] = loaded[key]
+
+    if not isinstance(state.get("plans"), dict):
+        state["plans"] = {}
+    if not isinstance(state.get("plan_order"), list):
+        state["plan_order"] = []
+    if not isinstance(state.get("changes"), dict):
+        state["changes"] = {}
+    if not isinstance(state.get("change_order"), list):
+        state["change_order"] = []
+
+    return state
+
+
+def _save_control_state(state: dict[str, Any]) -> None:
+    _ensure_control_paths()
+    CONTROL_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8", newline="")
+
+
+def _next_identifier(state: dict[str, Any], seq_key: str, prefix: str) -> str:
+    raw = state.get(seq_key, 1)
+    try:
+        seq = int(raw)
+    except Exception:
+        seq = 1
+    if seq < 1:
+        seq = 1
+    state[seq_key] = seq + 1
+    return f"{prefix}-{seq:04d}"
+
+
+def _compute_plan_progress(steps: list[dict[str, Any]]) -> tuple[int, int, int, dict[str, int]]:
+    counts = {status: 0 for status in PLAN_STEP_STATUSES}
+    for step in steps:
+        raw_status = str(step.get("status", "pending")).strip().lower()
+        status = raw_status if raw_status in PLAN_STEP_STATUSES else "pending"
+        counts[status] += 1
+
+    total_steps = len(steps)
+    completed = counts["completed"]
+    progress_percent = int((completed * 100) / total_steps) if total_steps > 0 else 0
+    return total_steps, completed, progress_percent, counts
+
+
+def _step_marker(status: str) -> str:
+    mapping = {
+        "pending": " ",
+        "in_progress": "~",
+        "completed": "x",
+        "blocked": "!",
+        "canceled": "-",
+    }
+    return mapping.get(status, "?")
+
+
+def _render_plan_visual(plan: dict[str, Any]) -> str:
+    steps_raw = plan.get("steps")
+    steps = steps_raw if isinstance(steps_raw, list) else []
+    total_steps, completed, progress_percent, _ = _compute_plan_progress(steps)
+
+    bar_width = 20
+    filled = int((progress_percent * bar_width) / 100)
+    lines = [f"[{('#' * filled) + ('-' * (bar_width - filled))}] {progress_percent}% ({completed}/{total_steps})"]
+
+    for index, step in enumerate(steps, start=1):
+        title = str(step.get("title", "")).strip()
+        status = str(step.get("status", "pending")).strip().lower()
+        note = str(step.get("note", "")).strip()
+        if status not in PLAN_STEP_STATUSES:
+            status = "pending"
+        line = f"{index}. [{_step_marker(status)}] {title}"
+        if note:
+            line += f" | {note}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    steps_raw = plan.get("steps")
+    steps = steps_raw if isinstance(steps_raw, list) else []
+    total_steps, completed, progress_percent, counts = _compute_plan_progress(steps)
+
+    return {
+        "id": plan.get("id"),
+        "title": plan.get("title", ""),
+        "description": plan.get("description", ""),
+        "created_at": plan.get("created_at"),
+        "updated_at": plan.get("updated_at"),
+        "archived": bool(plan.get("archived", False)),
+        "total_steps": total_steps,
+        "completed_steps": completed,
+        "progress_percent": progress_percent,
+        "status_counts": counts,
+        "steps": steps,
+        "visual": _render_plan_visual(plan),
+    }
+
+
+def _plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    payload = _plan_payload(plan)
+    payload.pop("steps", None)
+    payload.pop("visual", None)
+    return payload
+
+
+def _get_plan(state: dict[str, Any], plan_id: str) -> dict[str, Any]:
+    plans = state.get("plans")
+    if not isinstance(plans, dict):
+        raise ValueError("plan storage is not initialized")
+    plan = plans.get(plan_id)
+    if not isinstance(plan, dict):
+        raise ValueError(f"plan not found: {plan_id}")
+    return plan
+
+
+def _get_change(state: dict[str, Any], change_id: str) -> dict[str, Any]:
+    changes = state.get("changes")
+    if not isinstance(changes, dict):
+        raise ValueError("change storage is not initialized")
+    change = changes.get(change_id)
+    if not isinstance(change, dict):
+        raise ValueError(f"change not found: {change_id}")
+    return change
+
+
+def _track_original_for_change(change: dict[str, Any], path: Path) -> None:
+    tracked_raw = change.get("tracked_paths")
+    tracked: dict[str, Any]
+    if isinstance(tracked_raw, dict):
+        tracked = tracked_raw
+    else:
+        tracked = {}
+        change["tracked_paths"] = tracked
+
+    key = str(path)
+    if key in tracked:
+        return
+
+    existed = path.exists()
+    record: dict[str, Any] = {
+        "path": key,
+        "existed": existed,
+        "kind": "missing",
+        "backup_rel": None,
+    }
+
+    if existed:
+        kind = "directory" if path.is_dir() else "file" if path.is_file() else "other"
+        record["kind"] = kind
+        change_id = str(change.get("id", "change-unknown"))
+        backup_rel = f"{change_id}/{len(tracked) + 1:06d}"
+        backup_path = CHANGE_SNAPSHOT_ROOT / backup_rel
+
+        if backup_path.exists():
+            _remove_path(backup_path)
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if kind == "directory":
+            shutil.copytree(path, backup_path)
+        else:
+            shutil.copy2(path, backup_path)
+
+        record["backup_rel"] = backup_rel
+
+    tracked[key] = record
+
+
+def _is_subpath(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _run_git_command(repo_root: Path, args: list[str]) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+
+def _init_change_git_metadata(change_id: str) -> dict[str, Any]:
+    if not shutil.which("git"):
+        return {"enabled": False, "reason": "git_not_found"}
+
+    probe_root = Path.cwd().resolve()
+    code, stdout, stderr = _run_git_command(probe_root, ["rev-parse", "--show-toplevel"])
+    if code != 0 or not stdout:
+        detail = stderr or stdout or "not inside git repository"
+        return {"enabled": False, "reason": "not_git_repo", "detail": detail}
+
+    repo_root = Path(stdout).resolve()
+    code, snapshot_commit, stderr = _run_git_command(repo_root, ["stash", "create", f"codextools:{change_id}"])
+    if code != 0:
+        detail = stderr or "stash create failed"
+        _log(f"git snapshot init failed ({change_id}): {detail}")
+        return {"enabled": False, "reason": "stash_create_failed", "detail": detail}
+
+    baseline_oid = snapshot_commit.strip()
+    baseline_source = "stash"
+    if not baseline_oid:
+        code, head_oid, stderr = _run_git_command(repo_root, ["rev-parse", "HEAD"])
+        if code != 0 or not head_oid:
+            detail = stderr or head_oid or "unable to resolve HEAD"
+            _log(f"git baseline init failed ({change_id}): {detail}")
+            return {"enabled": False, "reason": "head_resolve_failed", "detail": detail}
+        baseline_oid = head_oid.strip()
+        baseline_source = "head"
+
+    baseline_ref = f"{GIT_CHANGE_REF_PREFIX}/{change_id}"
+    code, _, stderr = _run_git_command(repo_root, ["update-ref", baseline_ref, baseline_oid])
+    if code != 0:
+        detail = stderr or "update-ref failed"
+        _log(f"git baseline ref failed ({change_id}): {detail}")
+        return {"enabled": False, "reason": "update_ref_failed", "detail": detail}
+
+    return {
+        "enabled": True,
+        "repo_root": str(repo_root),
+        "baseline_ref": baseline_ref,
+        "baseline_oid": baseline_oid,
+        "baseline_source": baseline_source,
+    }
+
+
+def _cleanup_change_git_baseline(change: dict[str, Any]) -> None:
+    git_raw = change.get("git")
+    if not isinstance(git_raw, dict) or not bool(git_raw.get("enabled")):
+        return
+
+    repo_root_text = git_raw.get("repo_root")
+    baseline_ref = git_raw.get("baseline_ref")
+    if not isinstance(repo_root_text, str) or not repo_root_text:
+        return
+    if not isinstance(baseline_ref, str) or not baseline_ref:
+        return
+
+    code, _, stderr = _run_git_command(Path(repo_root_text).resolve(), ["update-ref", "-d", baseline_ref])
+    if code != 0:
+        detail = stderr or "unknown error"
+        _log(f"git baseline cleanup failed ({change.get('id', 'unknown')}): {detail}")
+
+
+def _rollback_snapshot_records(change: dict[str, Any]) -> int:
+    tracked_raw = change.get("tracked_paths")
+    tracked = tracked_raw if isinstance(tracked_raw, dict) else {}
+    records_raw = list(tracked.values())
+    records: list[dict[str, Any]] = [record for record in records_raw if isinstance(record, dict)]
+
+    records.sort(key=lambda item: len(Path(str(item.get("path", ""))).parts), reverse=True)
+
+    restore_errors: list[str] = []
+    restored_count = 0
+
+    for record in records:
+        path_text = str(record.get("path", "")).strip()
+        if not path_text:
+            continue
+
+        path = Path(path_text)
+        existed = bool(record.get("existed", False))
+        kind = str(record.get("kind", "missing"))
+
+        try:
+            if path.exists():
+                _remove_path(path)
+
+            if existed:
+                backup_rel = record.get("backup_rel")
+                if not isinstance(backup_rel, str) or not backup_rel:
+                    raise ValueError("backup path missing")
+                backup_path = CHANGE_SNAPSHOT_ROOT / backup_rel
+                if not backup_path.exists():
+                    raise ValueError(f"backup not found: {backup_path}")
+
+                if kind == "directory":
+                    shutil.copytree(backup_path, path)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup_path, path)
+
+            restored_count += 1
+        except Exception as e:
+            restore_errors.append(f"{path}: {e}")
+
+    if restore_errors:
+        raise RuntimeError("rollback failed for some paths: " + " | ".join(restore_errors))
+
+    return restored_count
+
+
+def _rollback_change_with_git(change: dict[str, Any]) -> None:
+    git_raw = change.get("git")
+    if not isinstance(git_raw, dict) or not bool(git_raw.get("enabled")):
+        raise ValueError("git metadata is missing for this change")
+
+    repo_root_text = git_raw.get("repo_root")
+    baseline_ref = git_raw.get("baseline_ref")
+    if not isinstance(repo_root_text, str) or not repo_root_text:
+        raise ValueError("git repo_root is missing")
+    if not isinstance(baseline_ref, str) or not baseline_ref:
+        raise ValueError("git baseline_ref is missing")
+
+    repo_root = Path(repo_root_text).resolve()
+    code, _, stderr = _run_git_command(repo_root, ["restore", "--source", baseline_ref, "--worktree", "--", "."])
+    if code != 0:
+        detail = stderr or "unknown error"
+        raise RuntimeError(f"git restore failed: {detail}")
+
+
+def _record_change_operation(tool_name: str, paths: list[Path], details: Optional[dict[str, Any]] = None) -> None:
+    state = _load_control_state()
+    active_change_id = state.get("active_change_id")
+    if not isinstance(active_change_id, str) or not active_change_id:
+        return
+
+    changes = state.get("changes")
+    if not isinstance(changes, dict):
+        return
+    change_raw = changes.get(active_change_id)
+    if not isinstance(change_raw, dict):
+        return
+    if str(change_raw.get("status", "active")) != "active":
+        return
+
+    mode = str(change_raw.get("mode", "snapshot")).strip().lower()
+    git_repo_root: Optional[Path] = None
+    git_raw = change_raw.get("git")
+    if mode == "git" and isinstance(git_raw, dict) and bool(git_raw.get("enabled")):
+        repo_root_text = git_raw.get("repo_root")
+        if isinstance(repo_root_text, str) and repo_root_text:
+            git_repo_root = Path(repo_root_text).resolve()
+
+    normalized_paths: list[str] = []
+    for path in paths:
+        resolved = path.resolve()
+        normalized_paths.append(str(resolved))
+        if mode == "git" and git_repo_root is not None and _is_subpath(resolved, git_repo_root):
+            continue
+        _track_original_for_change(change_raw, resolved)
+
+    operations_raw = change_raw.get("operations")
+    operations: list[dict[str, Any]]
+    if isinstance(operations_raw, list):
+        operations = operations_raw
+    else:
+        operations = []
+        change_raw["operations"] = operations
+
+    operation: dict[str, Any] = {
+        "time": _utc_now(),
+        "tool": tool_name,
+        "paths": normalized_paths,
+    }
+    if details is not None:
+        operation["details"] = details
+    operations.append(operation)
+    change_raw["updated_at"] = _utc_now()
+
+    _save_control_state(state)
+
+
+def _change_payload(change: dict[str, Any], active_change_id: Optional[str] = None) -> dict[str, Any]:
+    tracked_raw = change.get("tracked_paths")
+    tracked = tracked_raw if isinstance(tracked_raw, dict) else {}
+    operations_raw = change.get("operations")
+    operations = operations_raw if isinstance(operations_raw, list) else []
+
+    mode_raw = str(change.get("mode", "snapshot")).strip().lower()
+    mode = mode_raw if mode_raw in {"snapshot", "git"} else "snapshot"
+    git_raw = change.get("git")
+    git_enabled = bool(isinstance(git_raw, dict) and git_raw.get("enabled"))
+    git_repo_root = ""
+    if isinstance(git_raw, dict):
+        repo_root_text = git_raw.get("repo_root")
+        if isinstance(repo_root_text, str):
+            git_repo_root = repo_root_text
+
+    tracked_paths = list(tracked.keys())
+    lines = [
+        f"change_id: {change.get('id')}",
+        f"mode: {mode}",
+        f"status: {change.get('status', 'active')}",
+        f"tracked_paths: {len(tracked_paths)}",
+        f"operations: {len(operations)}",
+    ]
+    if git_enabled and git_repo_root:
+        lines.append(f"git_repo_root: {git_repo_root}")
+
+    for index, operation in enumerate(operations[-20:], start=max(1, len(operations) - 19)):
+        tool_name = str(operation.get("tool", ""))
+        op_paths = operation.get("paths")
+        path_count = len(op_paths) if isinstance(op_paths, list) else 0
+        lines.append(f"{index}. {tool_name} ({path_count} paths)")
+
+    return {
+        "id": change.get("id"),
+        "title": change.get("title", ""),
+        "description": change.get("description", ""),
+        "created_at": change.get("created_at"),
+        "updated_at": change.get("updated_at"),
+        "mode": mode,
+        "git_enabled": git_enabled,
+        "git_repo_root": git_repo_root if git_enabled else None,
+        "status": change.get("status", "active"),
+        "active": bool(active_change_id and change.get("id") == active_change_id),
+        "tracked_path_count": len(tracked_paths),
+        "tracked_paths": tracked_paths,
+        "operation_count": len(operations),
+        "operations": operations,
+        "visual": "\n".join(lines),
+    }
+
+
+def tool_plan_create(args: dict[str, Any]) -> dict[str, Any]:
+    title = _require_str(args, "title")
+    steps_arg = args.get("steps")
+    if not isinstance(steps_arg, list) or not steps_arg:
+        raise ValueError("`steps` must be a non-empty string array")
+
+    description = args.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError("`description` must be string")
+
+    now = _utc_now()
+    state = _load_control_state()
+    plan_id = _next_identifier(state, "next_plan_seq", "plan")
+
+    steps: list[dict[str, Any]] = []
+    for index, item in enumerate(steps_arg, start=1):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"`steps[{index - 1}]` must be a non-empty string")
+        steps.append(
+            {
+                "id": f"{plan_id}-step-{index}",
+                "title": item.strip(),
+                "status": "pending",
+                "note": "",
+                "updated_at": now,
+            }
+        )
+
+    plan = {
+        "id": plan_id,
+        "title": title.strip(),
+        "description": description,
+        "created_at": now,
+        "updated_at": now,
+        "archived": False,
+        "steps": steps,
+    }
+
+    plans_raw = state.get("plans")
+    plans: dict[str, Any] = plans_raw if isinstance(plans_raw, dict) else {}
+    plans[plan_id] = plan
+    state["plans"] = plans
+
+    plan_order_raw = state.get("plan_order")
+    plan_order: list[str] = plan_order_raw if isinstance(plan_order_raw, list) else []
+    plan_order.append(plan_id)
+    state["plan_order"] = plan_order
+
+    _save_control_state(state)
+    return _plan_payload(plan)
+
+
+def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
+    plan_id = _require_str(args, "plan_id")
+
+    status_raw = args.get("status")
+    if not isinstance(status_raw, str) or not status_raw.strip():
+        raise ValueError("`status` must be a non-empty string")
+    status = status_raw.strip().lower()
+    if status not in PLAN_STEP_STATUSES:
+        allowed = ", ".join(sorted(PLAN_STEP_STATUSES))
+        raise ValueError(f"`status` must be one of: {allowed}")
+
+    step_id = args.get("step_id")
+    step_index_arg = args.get("step_index")
+    if step_id is None and step_index_arg is None:
+        raise ValueError("Provide either `step_id` or `step_index`")
+
+    note = args.get("note")
+    if note is not None and not isinstance(note, str):
+        raise ValueError("`note` must be string")
+
+    exclusive_in_progress = _as_bool(args.get("exclusive_in_progress"), True)
+
+    state = _load_control_state()
+    plan = _get_plan(state, plan_id)
+    steps_raw = plan.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        raise ValueError(f"plan has no steps: {plan_id}")
+
+    target_index = -1
+    if step_id is not None:
+        if not isinstance(step_id, str) or not step_id.strip():
+            raise ValueError("`step_id` must be a non-empty string")
+        for index, step in enumerate(steps_raw):
+            if str(step.get("id", "")) == step_id:
+                target_index = index
+                break
+        if target_index < 0:
+            raise ValueError(f"step not found: {step_id}")
+    else:
+        step_index = _as_int(step_index_arg, 1, minimum=1)
+        if step_index > len(steps_raw):
+            raise ValueError("`step_index` is out of range")
+        target_index = step_index - 1
+
+    now = _utc_now()
+    if status == "in_progress" and exclusive_in_progress:
+        for index, step in enumerate(steps_raw):
+            if index == target_index:
+                continue
+            if str(step.get("status", "")).strip().lower() == "in_progress":
+                step["status"] = "pending"
+                step["updated_at"] = now
+
+    target_step = steps_raw[target_index]
+    target_step["status"] = status
+    target_step["updated_at"] = now
+    if note is not None:
+        target_step["note"] = note
+
+    plan["updated_at"] = now
+    _save_control_state(state)
+    return _plan_payload(plan)
+
+
+def tool_plan_view(args: dict[str, Any]) -> dict[str, Any]:
+    plan_id = _require_str(args, "plan_id")
+    state = _load_control_state()
+    plan = _get_plan(state, plan_id)
+    return _plan_payload(plan)
+
+
+def tool_plan_list(args: dict[str, Any]) -> dict[str, Any]:
+    include_archived = _as_bool(args.get("include_archived"), False)
+
+    state = _load_control_state()
+    plans_raw = state.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+    order_raw = state.get("plan_order")
+    order = order_raw if isinstance(order_raw, list) else []
+
+    summaries: list[dict[str, Any]] = []
+    for plan_id in order:
+        plan = plans.get(plan_id)
+        if not isinstance(plan, dict):
+            continue
+        if not include_archived and bool(plan.get("archived", False)):
+            continue
+        summaries.append(_plan_summary(plan))
+
+    return {"count": len(summaries), "plans": summaries}
+
+
+def tool_plan_archive(args: dict[str, Any]) -> dict[str, Any]:
+    plan_id = _require_str(args, "plan_id")
+    archived = _as_bool(args.get("archived"), True)
+
+    state = _load_control_state()
+    plan = _get_plan(state, plan_id)
+    plan["archived"] = archived
+    plan["updated_at"] = _utc_now()
+    _save_control_state(state)
+    return _plan_payload(plan)
+
+
+def tool_change_begin(args: dict[str, Any]) -> dict[str, Any]:
+    title = _require_str(args, "title")
+    description = args.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError("`description` must be string")
+
+    state = _load_control_state()
+    active_change_id = state.get("active_change_id")
+    if isinstance(active_change_id, str) and active_change_id:
+        active_change = state.get("changes", {}).get(active_change_id)
+        if isinstance(active_change, dict) and str(active_change.get("status", "active")) == "active":
+            raise ValueError(f"active change already exists: {active_change_id}")
+
+    change_id = _next_identifier(state, "next_change_seq", "change")
+    now = _utc_now()
+    change = {
+        "id": change_id,
+        "title": title.strip(),
+        "description": description,
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+        "operations": [],
+        "tracked_paths": {},
+        "mode": "snapshot",
+        "git": {"enabled": False, "reason": "not_initialized"},
+    }
+
+    git_metadata = _init_change_git_metadata(change_id)
+    change["git"] = git_metadata
+    change["mode"] = "git" if bool(git_metadata.get("enabled")) else "snapshot"
+
+    changes_raw = state.get("changes")
+    changes: dict[str, Any] = changes_raw if isinstance(changes_raw, dict) else {}
+    changes[change_id] = change
+    state["changes"] = changes
+
+    change_order_raw = state.get("change_order")
+    change_order: list[str] = change_order_raw if isinstance(change_order_raw, list) else []
+    change_order.append(change_id)
+    state["change_order"] = change_order
+
+    state["active_change_id"] = change_id
+    _save_control_state(state)
+    return _change_payload(change, active_change_id=change_id)
+
+
+def tool_change_set_active(args: dict[str, Any]) -> dict[str, Any]:
+    change_id = args.get("change_id")
+
+    state = _load_control_state()
+    if change_id is None:
+        state["active_change_id"] = None
+        _save_control_state(state)
+        return {"active_change_id": None}
+
+    if not isinstance(change_id, str) or not change_id.strip():
+        raise ValueError("`change_id` must be a non-empty string")
+
+    change = _get_change(state, change_id)
+    if str(change.get("status", "active")) != "active":
+        raise ValueError(f"change is not active: {change_id}")
+
+    state["active_change_id"] = change_id
+    _save_control_state(state)
+    return {"active_change_id": change_id}
+
+
+def tool_change_get(args: dict[str, Any]) -> dict[str, Any]:
+    change_id = _require_str(args, "change_id")
+    state = _load_control_state()
+    change = _get_change(state, change_id)
+    active_change_id = state.get("active_change_id") if isinstance(state.get("active_change_id"), str) else None
+    return _change_payload(change, active_change_id=active_change_id)
+
+
+def tool_change_list(args: dict[str, Any]) -> dict[str, Any]:
+    include_rolled_back = _as_bool(args.get("include_rolled_back"), True)
+
+    state = _load_control_state()
+    changes_raw = state.get("changes")
+    changes = changes_raw if isinstance(changes_raw, dict) else {}
+    order_raw = state.get("change_order")
+    order = order_raw if isinstance(order_raw, list) else []
+
+    active_change_id = state.get("active_change_id") if isinstance(state.get("active_change_id"), str) else None
+
+    summaries: list[dict[str, Any]] = []
+    for change_id in order:
+        change = changes.get(change_id)
+        if not isinstance(change, dict):
+            continue
+        if not include_rolled_back and str(change.get("status", "")) == "rolled_back":
+            continue
+        payload = _change_payload(change, active_change_id=active_change_id)
+        payload.pop("operations", None)
+        payload.pop("tracked_paths", None)
+        payload.pop("visual", None)
+        summaries.append(payload)
+
+    return {"active_change_id": active_change_id, "count": len(summaries), "changes": summaries}
+
+
+def tool_change_commit(args: dict[str, Any]) -> dict[str, Any]:
+    state = _load_control_state()
+
+    change_id_arg = args.get("change_id")
+    if change_id_arg is None:
+        active_change_id = state.get("active_change_id")
+        if not isinstance(active_change_id, str) or not active_change_id:
+            raise ValueError("No active change. Provide `change_id`.")
+        change_id = active_change_id
+    else:
+        if not isinstance(change_id_arg, str) or not change_id_arg.strip():
+            raise ValueError("`change_id` must be a non-empty string")
+        change_id = change_id_arg
+
+    change = _get_change(state, change_id)
+    status = str(change.get("status", "active"))
+    if status == "rolled_back":
+        raise ValueError(f"cannot commit rolled back change: {change_id}")
+
+    change["status"] = "committed"
+    change["updated_at"] = _utc_now()
+    _cleanup_change_git_baseline(change)
+
+    active_change_id = state.get("active_change_id")
+    if isinstance(active_change_id, str) and active_change_id == change_id:
+        state["active_change_id"] = None
+
+    _save_control_state(state)
+    return _change_payload(change, active_change_id=None)
+
+
+def tool_change_rollback(args: dict[str, Any]) -> dict[str, Any]:
+    state = _load_control_state()
+
+    change_id_arg = args.get("change_id")
+    if change_id_arg is None:
+        active_change_id = state.get("active_change_id")
+        if not isinstance(active_change_id, str) or not active_change_id:
+            raise ValueError("No active change. Provide `change_id`.")
+        change_id = active_change_id
+    else:
+        if not isinstance(change_id_arg, str) or not change_id_arg.strip():
+            raise ValueError("`change_id` must be a non-empty string")
+        change_id = change_id_arg
+
+    change = _get_change(state, change_id)
+    mode_raw = str(change.get("mode", "snapshot")).strip().lower()
+    mode = mode_raw if mode_raw in {"snapshot", "git"} else "snapshot"
+
+    if mode == "git":
+        _rollback_change_with_git(change)
+
+    restored_count = _rollback_snapshot_records(change)
+
+    change["status"] = "rolled_back"
+    change["updated_at"] = _utc_now()
+    change["rollback_restored_paths"] = restored_count
+    change["rollback_mode"] = mode
+    if mode == "git":
+        change["rollback_git_restore"] = True
+    _cleanup_change_git_baseline(change)
+
+    active_change_id = state.get("active_change_id")
+    if isinstance(active_change_id, str) and active_change_id == change_id:
+        state["active_change_id"] = None
+
+    _save_control_state(state)
+    return _change_payload(change, active_change_id=None)
 
 
 def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +1066,8 @@ def tool_fs_write_text(args: dict[str, Any]) -> dict[str, Any]:
     create_dirs = _as_bool(args.get("create_dirs"), True)
     encoding = str(args.get("encoding", "utf-8"))
 
+    _record_change_operation("fs_write_text", [path], {"append": append})
+
     if create_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -292,6 +1090,7 @@ def tool_fs_replace_text(args: dict[str, Any]) -> dict[str, Any]:
     available = text.count(old)
     replaced = min(available, count) if count else available
     updated = text.replace(old, new, count) if count else text.replace(old, new)
+    _record_change_operation("fs_replace_text", [path], {"count": count, "replacements": replaced})
     path.write_text(updated, encoding="utf-8", newline="")
 
     return {"path": str(path), "replacements": replaced}
@@ -333,6 +1132,11 @@ def tool_fs_replace_regex(args: dict[str, Any]) -> dict[str, Any]:
     compiled = re.compile(pattern, flags=_parse_regex_flags(flags_text))
     text = path.read_text(encoding="utf-8", errors="replace")
     updated, replaced = compiled.subn(repl, text, count=count)
+    _record_change_operation(
+        "fs_replace_regex",
+        [path],
+        {"pattern": pattern, "flags": flags_text, "count": count, "replacements": replaced},
+    )
     path.write_text(updated, encoding="utf-8", newline="")
 
     return {
@@ -368,6 +1172,11 @@ def tool_fs_patch_lines(args: dict[str, Any]) -> dict[str, Any]:
     replacement_lines = content.splitlines(keepends=True)
     removed = lines[start_line - 1 : end_line]
     updated_lines = lines[: start_line - 1] + replacement_lines + lines[end_line:]
+    _record_change_operation(
+        "fs_patch_lines",
+        [path],
+        {"start_line": start_line, "end_line": end_line, "removed_lines": len(removed), "added_lines": len(replacement_lines)},
+    )
     path.write_text("".join(updated_lines), encoding=encoding, newline="")
 
     return {
@@ -609,6 +1418,8 @@ def tool_fs_delete(args: dict[str, Any]) -> dict[str, Any]:
     recursive = _as_bool(args.get("recursive"), False)
     if not path.exists():
         return {"path": str(path), "deleted": False, "reason": "not found"}
+
+    _record_change_operation("fs_delete", [path], {"recursive": recursive})
     if path.is_dir():
         if recursive:
             shutil.rmtree(path)
@@ -655,6 +1466,16 @@ def tool_fs_move(args: dict[str, Any]) -> dict[str, Any]:
     dst = _path(_require_str(args, "destination"))
     copy = _as_bool(args.get("copy"), False)
     overwrite = _as_bool(args.get("overwrite"), False)
+
+    if not src.exists():
+        raise ValueError(f"source not found: {src}")
+    if src == dst:
+        raise ValueError("source and destination must be different")
+    if dst.exists() and not overwrite:
+        raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
+
+    tracked_paths = [dst] if copy else [src, dst]
+    _record_change_operation("fs_move", tracked_paths, {"copy": copy, "overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=copy, overwrite=overwrite)
 
 
@@ -668,6 +1489,9 @@ def tool_fs_move_file(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"source is not a file: {src}")
     if dst.exists() and dst.is_dir():
         raise ValueError(f"destination is a directory: {dst}")
+    if dst.exists() and not overwrite:
+        raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
+    _record_change_operation("fs_move_file", [src, dst], {"overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=False, overwrite=overwrite)
 
 
@@ -681,6 +1505,9 @@ def tool_fs_copy_file(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"source is not a file: {src}")
     if dst.exists() and dst.is_dir():
         raise ValueError(f"destination is a directory: {dst}")
+    if dst.exists() and not overwrite:
+        raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
+    _record_change_operation("fs_copy_file", [dst], {"overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=True, overwrite=overwrite)
 
 
@@ -699,6 +1526,7 @@ def tool_fs_create(args: dict[str, Any]) -> dict[str, Any]:
             if path.is_dir():
                 return {"path": str(path), "kind": "directory", "created": False, "exists": True}
             raise ValueError(f"path exists and is not a directory: {path}")
+        _record_change_operation("fs_create", [path], {"kind": "directory", "parents": parents})
         path.mkdir(parents=parents, exist_ok=False)
         return {"path": str(path), "kind": "directory", "created": True, "exists": True}
 
@@ -710,6 +1538,7 @@ def tool_fs_create(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"path exists and is a directory: {path}")
     if existed and not overwrite:
         raise ValueError(f"file exists: {path}. Set overwrite=true to replace.")
+    _record_change_operation("fs_create", [path], {"kind": "file", "overwrite": overwrite})
     if parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     written = path.write_text(content, encoding=encoding, newline="")
@@ -901,6 +1730,7 @@ def tool_img_draw(args: dict[str, Any]) -> dict[str, Any]:
     if fmt in {"JPEG", "BMP"} and img.mode == "RGBA":
         img = img.convert("RGB")
 
+    _record_change_operation("img_draw", [path], {"format": fmt, "width": width, "height": height})
     img.save(path, format=fmt)
     return {
         "path": str(path),
@@ -953,6 +1783,17 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "fs_move_file": tool_fs_move_file,
     "fs_copy_file": tool_fs_copy_file,
     "fs_create": tool_fs_create,
+    "plan_create": tool_plan_create,
+    "plan_update": tool_plan_update,
+    "plan_view": tool_plan_view,
+    "plan_list": tool_plan_list,
+    "plan_archive": tool_plan_archive,
+    "change_begin": tool_change_begin,
+    "change_set_active": tool_change_set_active,
+    "change_get": tool_change_get,
+    "change_list": tool_change_list,
+    "change_commit": tool_change_commit,
+    "change_rollback": tool_change_rollback,
     "proc_run": tool_proc_run,
     "img_draw": tool_img_draw,
     "sound_beep": tool_sound_beep,
@@ -975,6 +1816,17 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "fs_move_file": "Move a single file from source to destination.",
     "fs_copy_file": "Copy a single file from source to destination.",
     "fs_create": "Create a file or directory. Use kind=file|dir.",
+    "plan_create": "Create a progress plan with named steps.",
+    "plan_update": "Update status/note for a plan step and return visualization.",
+    "plan_view": "View one plan with a textual progress visualization.",
+    "plan_list": "List plans with progress summaries.",
+    "plan_archive": "Archive or unarchive a plan.",
+    "change_begin": "Start an active change set. Uses git baseline restore when available, otherwise file snapshots.",
+    "change_set_active": "Set or clear the active change set used for auto-tracking.",
+    "change_get": "Show tracked files/operations for one change set.",
+    "change_list": "List change sets and their status.",
+    "change_commit": "Finalize a change set without rollback or automatic git commit.",
+    "change_rollback": "Rollback a change set to begin state using git baseline restore or snapshot fallback.",
     "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Use this for npm, npx, git, python, and any CLI tool.",
     "img_draw": "Draw an image with primitive shapes (line, rect, ellipse, text, polygon). Requires Pillow.",
     "sound_beep": "Play a beep notification sound.",
@@ -1182,6 +2034,102 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "overwrite": {"type": "boolean", "default": False, "description": "Overwrite target file when kind=file"},
         },
         "required": ["path"],
+        "additionalProperties": False,
+    },
+    "plan_create": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "description": {"type": "string", "default": ""},
+            "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        },
+        "required": ["title", "steps"],
+        "additionalProperties": False,
+    },
+    "plan_update": {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "step_id": {"type": "string"},
+            "step_index": {"type": "integer", "minimum": 1},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "completed", "blocked", "canceled"],
+            },
+            "note": {"type": "string"},
+            "exclusive_in_progress": {"type": "boolean", "default": True},
+        },
+        "required": ["plan_id", "status"],
+        "anyOf": [{"required": ["step_id"]}, {"required": ["step_index"]}],
+        "additionalProperties": False,
+    },
+    "plan_view": {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+        },
+        "required": ["plan_id"],
+        "additionalProperties": False,
+    },
+    "plan_list": {
+        "type": "object",
+        "properties": {
+            "include_archived": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "plan_archive": {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            "archived": {"type": "boolean", "default": True},
+        },
+        "required": ["plan_id"],
+        "additionalProperties": False,
+    },
+    "change_begin": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "description": {"type": "string", "default": ""},
+        },
+        "required": ["title"],
+        "additionalProperties": False,
+    },
+    "change_set_active": {
+        "type": "object",
+        "properties": {
+            "change_id": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+    "change_get": {
+        "type": "object",
+        "properties": {
+            "change_id": {"type": "string"},
+        },
+        "required": ["change_id"],
+        "additionalProperties": False,
+    },
+    "change_list": {
+        "type": "object",
+        "properties": {
+            "include_rolled_back": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    },
+    "change_commit": {
+        "type": "object",
+        "properties": {
+            "change_id": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+    "change_rollback": {
+        "type": "object",
+        "properties": {
+            "change_id": {"type": "string"},
+        },
         "additionalProperties": False,
     },
     "proc_run": {

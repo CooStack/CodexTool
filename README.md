@@ -33,9 +33,30 @@ CodexTools 是一个基于 Python 的 MCP 工具服务，提供 UTF-8 文本读�
 - `fs_move_file`
 - `fs_copy_file`
 - `fs_create`
+- `plan_create`
+- `plan_update`
+- `plan_view`
+- `plan_list`
+- `plan_archive`
+- `change_begin`
+- `change_set_active`
+- `change_get`
+- `change_list`
+- `change_commit`
+- `change_rollback`
 - `proc_run`
 - `img_draw`
 - `sound_beep`
+
+## 计划可视化与变更回滚
+
+典型流程：
+
+1. `plan_create` 创建任务步骤。
+2. 执行过程中用 `plan_update` 更新步骤状态，用 `plan_view`/`plan_list` 查看进度可视化。
+3. 需要可撤回时先调用 `change_begin`，后续文件修改会自动记录快照。
+4. 用 `change_get`/`change_list` 查看本次改动。
+5. 确认后 `change_commit`，或用 `change_rollback` 一键回滚。
 
 ## 启动
 
