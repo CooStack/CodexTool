@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -11,10 +13,14 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from typing import Any, Callable, Optional, Tuple, Union
 
+from toolmodules import get_extension_tooling
+from toolmodules.extensions.common import install_package_with_pip
+
 SERVER_NAME = "CodexTools"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.1"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -79,12 +85,125 @@ def _path(path_text: str) -> Path:
     return Path(path_text).expanduser().resolve()
 
 
-STATE_ROOT = Path(__file__).resolve().parent / ".agent" / "state"
+def _resolve_workspace_root() -> Path:
+    env_override = os.environ.get("CODEXTOOLS_WORKSPACE_ROOT", "").strip()
+    if env_override:
+        return _path(env_override)
+
+    probe = Path.cwd().resolve()
+    if shutil.which("git"):
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(probe),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            repo_root = completed.stdout.strip()
+            if completed.returncode == 0 and repo_root:
+                return Path(repo_root).resolve()
+        except Exception:
+            pass
+
+    return probe
+
+
+def _workspace_state_key(workspace_root: Path) -> str:
+    normalized = str(workspace_root).strip()
+    if os.name == "nt":
+        normalized = normalized.lower()
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
+    return f"ws-{digest[:12]}"
+
+
+def _paths_equal(left: Path, right: Path) -> bool:
+    if os.name == "nt":
+        return str(left).lower() == str(right).lower()
+    return str(left) == str(right)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_NAME = PROJECT_ROOT.name
+WORKSPACE_ROOT = _resolve_workspace_root()
+WORKSPACE_STATE_KEY = _workspace_state_key(WORKSPACE_ROOT)
+STATE_ROOT = PROJECT_ROOT / ".agent" / "state" / WORKSPACE_STATE_KEY
 CONTROL_STATE_PATH = STATE_ROOT / "codextools_control_state.json"
-CHANGE_SNAPSHOT_ROOT = STATE_ROOT / "change_snapshots"
+PLAN_STORE_BACKUP_PATH = STATE_ROOT / "codextools_plan_store.json"
+
+
+def _runtime_project_name() -> str:
+    try:
+        workspace_root = _resolve_runtime_workspace_root()
+    except Exception:
+        workspace_root = WORKSPACE_ROOT
+
+    candidate = workspace_root.name.strip()
+    return candidate if candidate else PROJECT_NAME
+
+
+def _plan_markdown_path() -> Path:
+    try:
+        workspace_root = _resolve_runtime_workspace_root()
+    except Exception:
+        workspace_root = WORKSPACE_ROOT
+    return workspace_root / f"{_runtime_project_name()}-plan.md"
 
 PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "blocked", "canceled"}
-GIT_CHANGE_REF_PREFIX = "refs/codextools/baselines"
+LEGACY_PLAN_STORE_META_PATTERN = re.compile(r"^\s*<!--\s*plan-store-meta:([A-Za-z0-9+/=]+)\s*-->\s*$")
+LEGACY_PLAN_GROUP_META_PATTERN = re.compile(r"^\s*<!--\s*plan-meta:([A-Za-z0-9+/=]+)\s*-->\s*$")
+LEGACY_PLAN_STEP_META_PATTERN = re.compile(
+    r"^\s*-\s*\[( |x)\]\s*(.*?)\s*<!--\s*step-meta:([A-Za-z0-9+/=]+)\s*-->\s*$"
+)
+PLAN_SECTION_PATTERN = re.compile(r"^\s*##\s+(.+?)\s*$")
+PLAN_CHECKBOX_PATTERN = re.compile(r"^\s*-\s*\[( |x|X)\]\s*(.*?)\s*$")
+
+WRITE_GUARDED_TOOLS = {
+    "fs_write_text",
+    "fs_replace_text",
+    "fs_replace_regex",
+    "fs_patch_lines",
+    "fs_delete",
+    "fs_move",
+    "fs_move_file",
+    "fs_copy_file",
+    "fs_create",
+    "img_draw",
+}
+PROC_RUN_DENY_PRIMARY_COMMANDS = {
+    "cat",
+    "type",
+    "echo",
+    "sed",
+    "awk",
+    "perl",
+    "get-content",
+    "set-content",
+    "out-file",
+    "copy",
+    "cp",
+    "move",
+    "mv",
+    "rm",
+    "del",
+    "erase",
+    "mkdir",
+    "md",
+    "rmdir",
+    "rd",
+    "touch",
+    "new-item",
+    "ni",
+}
+PROC_RUN_REDIRECTION_PATTERN = re.compile(r"(?:^|\s)(?:\|>|>>|<|<<|1>|2>|1>>|2>>)(?:\s|$)")
+CONTINUE_CONFIRM_KEYWORDS = ("continue", "继续")
+MODEL_LINE_PATTERN = re.compile(r"(?m)^\s*model\s*=\s*[\"']([^\"']+)[\"']\s*$")
+AUTO_AGENT_BLOCK_START = "<!-- codextools:auto-agent-rules:v1:start -->"
+AUTO_AGENT_BLOCK_END = "<!-- codextools:auto-agent-rules:v1:end -->"
+FALLBACK_AGENT_RULES_TEXT = "# Agent Rules\n\n- Follow project instructions for this workspace.\n"
+_RUNTIME_MODEL_HINT = ""
+_RUNTIME_WORKSPACE_ROOT_HINT = ""
 
 
 def _utc_now() -> str:
@@ -93,19 +212,125 @@ def _utc_now() -> str:
 
 def _ensure_control_paths() -> None:
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    CHANGE_SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _default_guard_policy_state() -> dict[str, Any]:
+    return {
+        "enforce_plan_for_writes": True,
+        "enforce_proc_run_policy": True,
+        "latest_plan_id": None,
+        "continue_confirmed_plan_id": None,
+        "continue_confirmed_at": None,
+        "continue_confirmation_text": "",
+        "audit": [],
+    }
+
+
+def _normalize_guard_policy_state(raw: Any) -> dict[str, Any]:
+    guard = _default_guard_policy_state()
+    if not isinstance(raw, dict):
+        return guard
+
+    guard["enforce_plan_for_writes"] = bool(raw.get("enforce_plan_for_writes", True))
+    guard["enforce_proc_run_policy"] = bool(raw.get("enforce_proc_run_policy", True))
+
+    latest_plan_id = raw.get("latest_plan_id")
+    guard["latest_plan_id"] = latest_plan_id if isinstance(latest_plan_id, str) and latest_plan_id.strip() else None
+
+    confirmed_plan_id = raw.get("continue_confirmed_plan_id")
+    guard["continue_confirmed_plan_id"] = (
+        confirmed_plan_id if isinstance(confirmed_plan_id, str) and confirmed_plan_id.strip() else None
+    )
+
+    confirmed_at = raw.get("continue_confirmed_at")
+    guard["continue_confirmed_at"] = confirmed_at if isinstance(confirmed_at, str) and confirmed_at.strip() else None
+
+    confirmation_text = raw.get("continue_confirmation_text")
+    guard["continue_confirmation_text"] = confirmation_text if isinstance(confirmation_text, str) else ""
+
+    audit_raw = raw.get("audit")
+    if isinstance(audit_raw, list):
+        audit: list[dict[str, Any]] = []
+        for item in audit_raw:
+            if not isinstance(item, dict):
+                continue
+            entry_time = item.get("time")
+            entry_event = item.get("event")
+            entry_message = item.get("message")
+            if not isinstance(entry_time, str) or not entry_time.strip():
+                continue
+            if not isinstance(entry_event, str) or not entry_event.strip():
+                continue
+            if not isinstance(entry_message, str) or not entry_message.strip():
+                continue
+            entry: dict[str, Any] = {
+                "time": entry_time.strip(),
+                "event": entry_event.strip(),
+                "message": entry_message.strip(),
+            }
+            entry_tool = item.get("tool")
+            if isinstance(entry_tool, str) and entry_tool.strip():
+                entry["tool"] = entry_tool.strip()
+            extra = item.get("extra")
+            if isinstance(extra, dict) and extra:
+                entry["extra"] = extra
+            audit.append(entry)
+        guard["audit"] = audit[-200:]
+
+    return guard
+
+
+def _ensure_guard_policy_state(state: dict[str, Any]) -> dict[str, Any]:
+    guard = _normalize_guard_policy_state(state.get("guard_policy"))
+    state["guard_policy"] = guard
+    return guard
+
+
+def _append_guard_audit(
+    state: dict[str, Any],
+    *,
+    event: str,
+    message: str,
+    tool: Optional[str] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    guard = _ensure_guard_policy_state(state)
+    audit_raw = guard.get("audit")
+    audit = audit_raw if isinstance(audit_raw, list) else []
+
+    entry: dict[str, Any] = {
+        "time": _utc_now(),
+        "event": event,
+        "message": message,
+    }
+    if isinstance(tool, str) and tool.strip():
+        entry["tool"] = tool.strip()
+    if isinstance(extra, dict) and extra:
+        entry["extra"] = extra
+
+    audit.append(entry)
+    guard["audit"] = audit[-200:]
 
 
 def _default_control_state() -> dict[str, Any]:
     return {
         "version": 1,
+        "workspace_root": str(WORKSPACE_ROOT),
+        "workspace_state_key": WORKSPACE_STATE_KEY,
         "next_plan_seq": 1,
         "plans": {},
         "plan_order": [],
-        "next_change_seq": 1,
-        "changes": {},
-        "change_order": [],
-        "active_change_id": None,
+        "guard_policy": _default_guard_policy_state(),
+    }
+
+
+def _default_plan_store() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "project_name": _runtime_project_name(),
+        "next_plan_seq": 1,
+        "plans": {},
+        "plan_order": [],
     }
 
 
@@ -131,11 +356,10 @@ def _load_control_state() -> dict[str, Any]:
         state["plans"] = {}
     if not isinstance(state.get("plan_order"), list):
         state["plan_order"] = []
-    if not isinstance(state.get("changes"), dict):
-        state["changes"] = {}
-    if not isinstance(state.get("change_order"), list):
-        state["change_order"] = []
+    state["workspace_root"] = str(WORKSPACE_ROOT)
+    state["workspace_state_key"] = WORKSPACE_STATE_KEY
 
+    _ensure_guard_policy_state(state)
     return state
 
 
@@ -156,11 +380,15 @@ def _next_identifier(state: dict[str, Any], seq_key: str, prefix: str) -> str:
     return f"{prefix}-{seq:04d}"
 
 
+def _coerce_plan_status(value: Any) -> str:
+    status = str(value).strip().lower()
+    return status if status in PLAN_STEP_STATUSES else "pending"
+
+
 def _compute_plan_progress(steps: list[dict[str, Any]]) -> tuple[int, int, int, dict[str, int]]:
     counts = {status: 0 for status in PLAN_STEP_STATUSES}
     for step in steps:
-        raw_status = str(step.get("status", "pending")).strip().lower()
-        status = raw_status if raw_status in PLAN_STEP_STATUSES else "pending"
+        status = _coerce_plan_status(step.get("status", "pending"))
         counts[status] += 1
 
     total_steps = len(steps)
@@ -169,70 +397,560 @@ def _compute_plan_progress(steps: list[dict[str, Any]]) -> tuple[int, int, int, 
     return total_steps, completed, progress_percent, counts
 
 
-def _step_marker(status: str) -> str:
-    mapping = {
-        "pending": " ",
-        "in_progress": "~",
-        "completed": "x",
-        "blocked": "!",
-        "canceled": "-",
-    }
-    return mapping.get(status, "?")
+def _compact_text(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+    text = value if isinstance(value, str) else str(value)
+    compact = " ".join(part for part in text.splitlines() if part.strip())
+    return compact.strip() or fallback
 
 
-def _render_plan_visual(plan: dict[str, Any]) -> str:
-    steps_raw = plan.get("steps")
-    steps = steps_raw if isinstance(steps_raw, list) else []
-    total_steps, completed, progress_percent, _ = _compute_plan_progress(steps)
-
-    bar_width = 20
-    filled = int((progress_percent * bar_width) / 100)
-    lines = [f"[{('#' * filled) + ('-' * (bar_width - filled))}] {progress_percent}% ({completed}/{total_steps})"]
-
-    for index, step in enumerate(steps, start=1):
-        title = str(step.get("title", "")).strip()
-        status = str(step.get("status", "pending")).strip().lower()
-        note = str(step.get("note", "")).strip()
-        if status not in PLAN_STEP_STATUSES:
-            status = "pending"
-        line = f"{index}. [{_step_marker(status)}] {title}"
-        if note:
-            line += f" | {note}"
-        lines.append(line)
-
-    return "\n".join(lines)
+def _decode_legacy_plan_meta(token: str) -> Optional[dict[str, Any]]:
+    try:
+        raw = base64.b64decode(token.encode("ascii"), validate=True).decode("utf-8")
+        loaded = json.loads(raw)
+    except Exception:
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
-def _plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
-    steps_raw = plan.get("steps")
-    steps = steps_raw if isinstance(steps_raw, list) else []
-    total_steps, completed, progress_percent, counts = _compute_plan_progress(steps)
+def _normalize_plan_store(store_raw: Any) -> dict[str, Any]:
+    default_now = _utc_now()
+    store = _default_plan_store()
+
+    if isinstance(store_raw, dict):
+        for key in ("version", "project_name", "next_plan_seq", "plans", "plan_order"):
+            if key in store_raw:
+                store[key] = store_raw[key]
+
+    try:
+        version = int(store.get("version", 1))
+    except Exception:
+        version = 1
+    if version < 1:
+        version = 1
+
+    project_name_raw = store.get("project_name")
+    project_name = project_name_raw.strip() if isinstance(project_name_raw, str) else ""
+    if not project_name:
+        project_name = _runtime_project_name()
+
+    plans_input = store.get("plans")
+    plans_input_dict = plans_input if isinstance(plans_input, dict) else {}
+
+    plans: dict[str, Any] = {}
+    for raw_plan_key, raw_plan in plans_input_dict.items():
+        if not isinstance(raw_plan, dict):
+            continue
+
+        fallback_plan_id = str(raw_plan_key).strip()
+        plan_id_value = raw_plan.get("id", fallback_plan_id)
+        plan_id = str(plan_id_value).strip()
+        if not plan_id:
+            continue
+
+        plan_created = _compact_text(raw_plan.get("created_at"), default_now)
+        plan_updated = _compact_text(raw_plan.get("updated_at"), plan_created)
+        plan_title = _compact_text(raw_plan.get("title"), plan_id)
+        description_raw = raw_plan.get("description", "")
+        description = description_raw if isinstance(description_raw, str) else str(description_raw)
+
+        steps_out: list[dict[str, Any]] = []
+        steps_raw = raw_plan.get("steps")
+        if isinstance(steps_raw, list):
+            for index, step_raw in enumerate(steps_raw, start=1):
+                if not isinstance(step_raw, dict):
+                    continue
+
+                step_id_value = step_raw.get("id", f"{plan_id}-step-{index}")
+                step_id = _compact_text(step_id_value, f"{plan_id}-step-{index}")
+                step_title = _compact_text(step_raw.get("title"), f"Step {index}")
+                step_status = _coerce_plan_status(step_raw.get("status", "pending"))
+                step_note_raw = step_raw.get("note", "")
+                step_note = step_note_raw if isinstance(step_note_raw, str) else str(step_note_raw)
+                step_updated = _compact_text(step_raw.get("updated_at"), plan_updated)
+
+                steps_out.append(
+                    {
+                        "id": step_id,
+                        "title": step_title,
+                        "status": step_status,
+                        "note": step_note,
+                        "updated_at": step_updated,
+                    }
+                )
+
+        plans[plan_id] = {
+            "id": plan_id,
+            "title": plan_title,
+            "description": description,
+            "created_at": plan_created,
+            "updated_at": plan_updated,
+            "archived": bool(raw_plan.get("archived", False)),
+            "steps": steps_out,
+        }
+
+    order_input = store.get("plan_order")
+    order: list[str] = []
+    if isinstance(order_input, list):
+        for item in order_input:
+            if not isinstance(item, str):
+                continue
+            plan_id = item.strip()
+            if not plan_id or plan_id not in plans or plan_id in order:
+                continue
+            order.append(plan_id)
+
+    for plan_id in plans.keys():
+        if plan_id not in order:
+            order.append(plan_id)
+
+    raw_next_seq = store.get("next_plan_seq", 1)
+    try:
+        next_seq = int(raw_next_seq)
+    except Exception:
+        next_seq = 1
+    if next_seq < 1:
+        next_seq = 1
+
+    max_existing_seq = 0
+    for plan_id in plans.keys():
+        matched = re.fullmatch(r"plan-(\d+)", plan_id)
+        if not matched:
+            continue
+        max_existing_seq = max(max_existing_seq, int(matched.group(1)))
+
+    if next_seq <= max_existing_seq:
+        next_seq = max_existing_seq + 1
 
     return {
-        "id": plan.get("id"),
-        "title": plan.get("title", ""),
-        "description": plan.get("description", ""),
-        "created_at": plan.get("created_at"),
-        "updated_at": plan.get("updated_at"),
-        "archived": bool(plan.get("archived", False)),
-        "total_steps": total_steps,
-        "completed_steps": completed,
-        "progress_percent": progress_percent,
-        "status_counts": counts,
-        "steps": steps,
-        "visual": _render_plan_visual(plan),
+        "version": version,
+        "project_name": project_name,
+        "next_plan_seq": next_seq,
+        "plans": plans,
+        "plan_order": order,
     }
 
 
-def _plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
-    payload = _plan_payload(plan)
-    payload.pop("steps", None)
-    payload.pop("visual", None)
-    return payload
+def _next_step_identifier(plan_id: str, steps: list[dict[str, Any]]) -> str:
+    max_index = 0
+    pattern = re.compile(rf"^{re.escape(plan_id)}-step-(\d+)$")
+    for step in steps:
+        step_id = _compact_text(step.get("id"), "")
+        matched = pattern.fullmatch(step_id)
+        if not matched:
+            continue
+        max_index = max(max_index, int(matched.group(1)))
+    return f"{plan_id}-step-{max_index + 1}"
 
 
-def _get_plan(state: dict[str, Any], plan_id: str) -> dict[str, Any]:
-    plans = state.get("plans")
+def _cleanup_plan_title_for_user_view(title: str) -> str:
+    compact = _compact_text(title, "")
+    parts = [part.strip() for part in compact.split("|")]
+    if len(parts) >= 3 and re.fullmatch(r"[A-Z]+计划组", parts[0]) and re.fullmatch(r"plan-\d+", parts[1]):
+        return _compact_text(parts[-1], compact)
+    return compact
+
+
+def _cleanup_step_title_for_user_view(title: str) -> str:
+    cleaned = _compact_text(title, "")
+
+    if "<!--" in cleaned:
+        cleaned = cleaned.split("<!--", 1)[0].strip()
+    if "| note:" in cleaned:
+        cleaned = cleaned.split("| note:", 1)[0].strip()
+
+    cleaned = re.sub(r"\(`plan-\d+-step-\d+`\)", "", cleaned).strip()
+    cleaned = re.sub(r"\[(已完成|进行中|待办|阻塞|已取消)\]", "", cleaned).strip()
+    return cleaned
+
+
+def _parse_simple_plan_markdown(text: str) -> list[dict[str, Any]]:
+    plans: list[dict[str, Any]] = []
+    current: Optional[dict[str, Any]] = None
+
+    for raw_line in text.splitlines():
+        section_match = PLAN_SECTION_PATTERN.match(raw_line)
+        if section_match:
+            title = _cleanup_plan_title_for_user_view(section_match.group(1))
+            if current and _compact_text(current.get("title"), ""):
+                plans.append(current)
+            current = {"title": title, "description": "", "steps": []}
+            continue
+
+        if current is None:
+            continue
+
+        stripped = raw_line.strip()
+        if stripped.startswith("- 描述:"):
+            current["description"] = stripped.split(":", 1)[1].strip()
+            continue
+
+        checkbox_match = PLAN_CHECKBOX_PATTERN.match(raw_line)
+        if checkbox_match:
+            step_title = _cleanup_step_title_for_user_view(checkbox_match.group(2))
+            if not step_title:
+                continue
+            current_steps = current.get("steps")
+            if isinstance(current_steps, list):
+                current_steps.append(
+                    {
+                        "title": step_title,
+                        "completed": checkbox_match.group(1).lower() == "x",
+                    }
+                )
+
+    if current and _compact_text(current.get("title"), ""):
+        plans.append(current)
+
+    return plans
+def _parse_legacy_plan_markdown(text: str) -> dict[str, Any]:
+    raw_store = _default_plan_store()
+    plans: dict[str, Any] = {}
+    plan_order: list[str] = []
+    current_plan_id: Optional[str] = None
+
+    for line in text.splitlines():
+        matched_store_meta = LEGACY_PLAN_STORE_META_PATTERN.match(line)
+        if matched_store_meta:
+            decoded = _decode_legacy_plan_meta(matched_store_meta.group(1))
+            if isinstance(decoded, dict):
+                if "version" in decoded:
+                    raw_store["version"] = decoded["version"]
+                if "project_name" in decoded:
+                    raw_store["project_name"] = decoded["project_name"]
+                if "next_plan_seq" in decoded:
+                    raw_store["next_plan_seq"] = decoded["next_plan_seq"]
+            continue
+
+        matched_plan_meta = LEGACY_PLAN_GROUP_META_PATTERN.match(line)
+        if matched_plan_meta:
+            decoded = _decode_legacy_plan_meta(matched_plan_meta.group(1))
+            if not isinstance(decoded, dict):
+                current_plan_id = None
+                continue
+
+            plan_id_raw = decoded.get("id")
+            if not isinstance(plan_id_raw, str) or not plan_id_raw.strip():
+                current_plan_id = None
+                continue
+
+            plan_id = plan_id_raw.strip()
+            plan_data = dict(decoded)
+            plan_data["id"] = plan_id
+            plan_data["steps"] = []
+            plans[plan_id] = plan_data
+            if plan_id not in plan_order:
+                plan_order.append(plan_id)
+            current_plan_id = plan_id
+            continue
+
+        matched_step_meta = LEGACY_PLAN_STEP_META_PATTERN.match(line)
+        if matched_step_meta and current_plan_id:
+            visible_title = _compact_text(matched_step_meta.group(2), "")
+            decoded = _decode_legacy_plan_meta(matched_step_meta.group(3))
+            step_data = dict(decoded) if isinstance(decoded, dict) else {}
+            if not _compact_text(step_data.get("title"), ""):
+                step_data["title"] = visible_title
+
+            current_plan = plans.get(current_plan_id)
+            if isinstance(current_plan, dict):
+                current_steps = current_plan.get("steps")
+                if isinstance(current_steps, list):
+                    current_steps.append(step_data)
+
+    raw_store["plans"] = plans
+    raw_store["plan_order"] = plan_order
+    return _normalize_plan_store(raw_store)
+
+
+def _looks_like_legacy_plan_markdown(text: str) -> bool:
+    return "<!-- plan-meta:" in text or "<!-- step-meta:" in text or "<!-- plan-store-meta:" in text
+
+
+def _sync_store_with_user_markdown(store: dict[str, Any], markdown_text: str) -> dict[str, Any]:
+    normalized = _normalize_plan_store(store)
+    user_plans = _parse_simple_plan_markdown(markdown_text)
+
+    plans_raw = normalized.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+    order_raw = normalized.get("plan_order")
+    order = order_raw if isinstance(order_raw, list) else []
+
+    title_queues: dict[str, list[str]] = {}
+    for plan_id in order:
+        plan = plans.get(plan_id)
+        if not isinstance(plan, dict):
+            continue
+        title = _compact_text(plan.get("title"), plan_id)
+        title_queues.setdefault(title, []).append(plan_id)
+
+    used_plan_ids: set[str] = set()
+    new_plans: dict[str, Any] = {}
+    new_order: list[str] = []
+    now = _utc_now()
+
+    for user_plan in user_plans:
+        user_title = _compact_text(user_plan.get("title"), "")
+        if not user_title:
+            continue
+
+        matched_plan_id: Optional[str] = None
+        queued = title_queues.get(user_title, [])
+        while queued:
+            candidate = queued.pop(0)
+            if candidate in used_plan_ids:
+                continue
+            matched_plan_id = candidate
+            break
+
+        existing_plan = plans.get(matched_plan_id) if isinstance(matched_plan_id, str) else None
+        if not isinstance(existing_plan, dict):
+            matched_plan_id = _next_identifier(normalized, "next_plan_seq", "plan")
+            existing_plan = None
+
+        assert isinstance(matched_plan_id, str)
+        used_plan_ids.add(matched_plan_id)
+
+        description_raw = user_plan.get("description", "")
+        description = description_raw if isinstance(description_raw, str) else str(description_raw)
+
+        existing_steps_raw = existing_plan.get("steps") if isinstance(existing_plan, dict) else []
+        existing_steps = existing_steps_raw if isinstance(existing_steps_raw, list) else []
+
+        used_step_indexes: set[int] = set()
+        new_steps: list[dict[str, Any]] = []
+        user_steps_raw = user_plan.get("steps")
+        user_steps = user_steps_raw if isinstance(user_steps_raw, list) else []
+
+        for user_step in user_steps:
+            step_title = _compact_text(user_step.get("title"), "")
+            if not step_title:
+                continue
+            checked = bool(user_step.get("completed", False))
+
+            matched_step_index = -1
+            matched_step: Optional[dict[str, Any]] = None
+            for idx, old_step in enumerate(existing_steps):
+                if idx in used_step_indexes or not isinstance(old_step, dict):
+                    continue
+                if _compact_text(old_step.get("title"), "") == step_title:
+                    matched_step_index = idx
+                    matched_step = old_step
+                    break
+
+            if matched_step_index >= 0 and isinstance(matched_step, dict):
+                used_step_indexes.add(matched_step_index)
+                step_id = _compact_text(matched_step.get("id"), _next_step_identifier(matched_plan_id, existing_steps + new_steps))
+                previous_status = _coerce_plan_status(matched_step.get("status", "pending"))
+                if checked:
+                    step_status = "completed"
+                elif previous_status == "completed":
+                    step_status = "pending"
+                else:
+                    step_status = previous_status
+
+                step_note_raw = matched_step.get("note", "")
+                step_note = step_note_raw if isinstance(step_note_raw, str) else str(step_note_raw)
+                step_updated = _compact_text(matched_step.get("updated_at"), now)
+                if step_status != previous_status:
+                    step_updated = now
+            else:
+                step_id = _next_step_identifier(matched_plan_id, existing_steps + new_steps)
+                step_status = "completed" if checked else "pending"
+                step_note = ""
+                step_updated = now
+
+            new_steps.append(
+                {
+                    "id": step_id,
+                    "title": step_title,
+                    "status": step_status,
+                    "note": step_note,
+                    "updated_at": step_updated,
+                }
+            )
+
+        if isinstance(existing_plan, dict):
+            created_at = _compact_text(existing_plan.get("created_at"), now)
+            archived = bool(existing_plan.get("archived", False))
+            previous_compare = [
+                (_compact_text(step.get("title"), ""), _coerce_plan_status(step.get("status", "pending")))
+                for step in existing_steps
+                if isinstance(step, dict)
+            ]
+            new_compare = [
+                (_compact_text(step.get("title"), ""), _coerce_plan_status(step.get("status", "pending")))
+                for step in new_steps
+            ]
+            title_changed = _compact_text(existing_plan.get("title"), "") != user_title
+            desc_changed = _compact_text(existing_plan.get("description"), "") != _compact_text(description, "")
+            steps_changed = previous_compare != new_compare
+            updated_at = now if (title_changed or desc_changed or steps_changed) else _compact_text(existing_plan.get("updated_at"), created_at)
+        else:
+            created_at = now
+            updated_at = now
+            archived = False
+
+        plan_payload = {
+            "id": matched_plan_id,
+            "title": user_title,
+            "description": description,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "archived": archived,
+            "steps": new_steps,
+        }
+
+        new_plans[matched_plan_id] = plan_payload
+        new_order.append(matched_plan_id)
+
+    normalized["plans"] = new_plans
+    normalized["plan_order"] = new_order
+    return _normalize_plan_store(normalized)
+
+
+def _render_plan_group_markdown(plan: dict[str, Any]) -> list[str]:
+    plan_title = _compact_text(plan.get("title"), "未命名计划")
+    description = _compact_text(plan.get("description"), "")
+
+    lines = [f"## {plan_title}"]
+    if description:
+        lines.append(f"- 描述: {description}")
+
+    steps_raw = plan.get("steps")
+    steps = steps_raw if isinstance(steps_raw, list) else []
+    if not steps:
+        lines.append("- [ ] (暂无任务)")
+        return lines
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        step_title = _compact_text(step.get("title"), "")
+        if not step_title:
+            continue
+        checked = _coerce_plan_status(step.get("status", "pending")) == "completed"
+        lines.append(f"- [{'x' if checked else ' '}] {step_title}")
+
+    if len(lines) == 1:
+        lines.append("- [ ] (暂无任务)")
+
+    return lines
+
+
+def _iter_plan_groups(store: dict[str, Any], include_archived: bool) -> list[tuple[str, dict[str, Any]]]:
+    plans_raw = store.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+    order_raw = store.get("plan_order")
+    order = order_raw if isinstance(order_raw, list) else []
+
+    groups: list[tuple[str, dict[str, Any]]] = []
+    for plan_id in order:
+        plan = plans.get(plan_id)
+        if not isinstance(plan, dict):
+            continue
+        if not include_archived and bool(plan.get("archived", False)):
+            continue
+        groups.append((plan_id, plan))
+
+    return groups
+
+
+def _render_plan_markdown(
+    store: dict[str, Any],
+    include_archived: bool,
+    only_plan_id: Optional[str] = None,
+) -> str:
+    normalized = _normalize_plan_store(store)
+    groups = _iter_plan_groups(normalized, include_archived=include_archived)
+
+    project_name_raw = normalized.get("project_name")
+    project_name = project_name_raw.strip() if isinstance(project_name_raw, str) else ""
+    if not project_name:
+        project_name = _runtime_project_name()
+
+    lines = [
+        f"# {project_name}-plan",
+    ]
+
+    has_output = False
+    for plan_id, plan in groups:
+        if only_plan_id is not None and plan_id != only_plan_id:
+            continue
+        lines.append("")
+        lines.extend(_render_plan_group_markdown(plan))
+        has_output = True
+
+    if not has_output:
+        lines.extend(["", "_暂无计划组_"])
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _save_plan_store(store: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_plan_store(store)
+    _ensure_control_paths()
+    PLAN_STORE_BACKUP_PATH.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8", newline="")
+    rendered = _render_plan_markdown(normalized, include_archived=True)
+    plan_markdown_path = _plan_markdown_path()
+    plan_markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_markdown_path.write_text(rendered, encoding="utf-8", newline="")
+    return normalized
+
+
+def _migrate_plan_store_from_control_state() -> dict[str, Any]:
+    control_state = _load_control_state()
+    raw_store = {
+        "version": 1,
+        "project_name": _runtime_project_name(),
+        "next_plan_seq": control_state.get("next_plan_seq", 1),
+        "plans": control_state.get("plans", {}),
+        "plan_order": control_state.get("plan_order", []),
+    }
+    return _normalize_plan_store(raw_store)
+
+
+def _load_plan_store() -> dict[str, Any]:
+    _ensure_control_paths()
+
+    plan_markdown_path = _plan_markdown_path()
+    markdown_text = ""
+    if plan_markdown_path.exists():
+        try:
+            markdown_text = plan_markdown_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            _log(f"plan markdown read failed: {e}")
+            markdown_text = ""
+
+    if PLAN_STORE_BACKUP_PATH.exists():
+        try:
+            backup_text = PLAN_STORE_BACKUP_PATH.read_text(encoding="utf-8", errors="replace")
+            backup_raw = json.loads(backup_text)
+            store = _normalize_plan_store(backup_raw)
+        except Exception as e:
+            _log(f"plan backup load failed, fallback migration: {e}")
+            store = _migrate_plan_store_from_control_state()
+
+        if markdown_text:
+            store = _sync_store_with_user_markdown(store, markdown_text)
+        return _save_plan_store(store)
+
+    if markdown_text and _looks_like_legacy_plan_markdown(markdown_text):
+        store = _parse_legacy_plan_markdown(markdown_text)
+        return _save_plan_store(store)
+
+    if markdown_text:
+        seed = _default_plan_store()
+        store = _sync_store_with_user_markdown(seed, markdown_text)
+        return _save_plan_store(store)
+
+    store = _migrate_plan_store_from_control_state()
+    return _save_plan_store(store)
+
+
+def _get_plan(store: dict[str, Any], plan_id: str) -> dict[str, Any]:
+    plans = store.get("plans")
     if not isinstance(plans, dict):
         raise ValueError("plan storage is not initialized")
     plan = plans.get(plan_id)
@@ -241,312 +959,619 @@ def _get_plan(state: dict[str, Any], plan_id: str) -> dict[str, Any]:
     return plan
 
 
-def _get_change(state: dict[str, Any], change_id: str) -> dict[str, Any]:
-    changes = state.get("changes")
-    if not isinstance(changes, dict):
-        raise ValueError("change storage is not initialized")
-    change = changes.get(change_id)
-    if not isinstance(change, dict):
-        raise ValueError(f"change not found: {change_id}")
-    return change
+def _load_plan_store_for_guard() -> dict[str, Any]:
+    _ensure_control_paths()
 
-
-def _track_original_for_change(change: dict[str, Any], path: Path) -> None:
-    tracked_raw = change.get("tracked_paths")
-    tracked: dict[str, Any]
-    if isinstance(tracked_raw, dict):
-        tracked = tracked_raw
-    else:
-        tracked = {}
-        change["tracked_paths"] = tracked
-
-    key = str(path)
-    if key in tracked:
-        return
-
-    existed = path.exists()
-    record: dict[str, Any] = {
-        "path": key,
-        "existed": existed,
-        "kind": "missing",
-        "backup_rel": None,
-    }
-
-    if existed:
-        kind = "directory" if path.is_dir() else "file" if path.is_file() else "other"
-        record["kind"] = kind
-        change_id = str(change.get("id", "change-unknown"))
-        backup_rel = f"{change_id}/{len(tracked) + 1:06d}"
-        backup_path = CHANGE_SNAPSHOT_ROOT / backup_rel
-
-        if backup_path.exists():
-            _remove_path(backup_path)
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if kind == "directory":
-            shutil.copytree(path, backup_path)
-        else:
-            shutil.copy2(path, backup_path)
-
-        record["backup_rel"] = backup_rel
-
-    tracked[key] = record
-
-
-def _is_subpath(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _run_git_command(repo_root: Path, args: list[str]) -> tuple[int, str, str]:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
-
-
-def _init_change_git_metadata(change_id: str) -> dict[str, Any]:
-    if not shutil.which("git"):
-        return {"enabled": False, "reason": "git_not_found"}
-
-    probe_root = Path.cwd().resolve()
-    code, stdout, stderr = _run_git_command(probe_root, ["rev-parse", "--show-toplevel"])
-    if code != 0 or not stdout:
-        detail = stderr or stdout or "not inside git repository"
-        return {"enabled": False, "reason": "not_git_repo", "detail": detail}
-
-    repo_root = Path(stdout).resolve()
-    code, snapshot_commit, stderr = _run_git_command(repo_root, ["stash", "create", f"codextools:{change_id}"])
-    if code != 0:
-        detail = stderr or "stash create failed"
-        _log(f"git snapshot init failed ({change_id}): {detail}")
-        return {"enabled": False, "reason": "stash_create_failed", "detail": detail}
-
-    baseline_oid = snapshot_commit.strip()
-    baseline_source = "stash"
-    if not baseline_oid:
-        code, head_oid, stderr = _run_git_command(repo_root, ["rev-parse", "HEAD"])
-        if code != 0 or not head_oid:
-            detail = stderr or head_oid or "unable to resolve HEAD"
-            _log(f"git baseline init failed ({change_id}): {detail}")
-            return {"enabled": False, "reason": "head_resolve_failed", "detail": detail}
-        baseline_oid = head_oid.strip()
-        baseline_source = "head"
-
-    baseline_ref = f"{GIT_CHANGE_REF_PREFIX}/{change_id}"
-    code, _, stderr = _run_git_command(repo_root, ["update-ref", baseline_ref, baseline_oid])
-    if code != 0:
-        detail = stderr or "update-ref failed"
-        _log(f"git baseline ref failed ({change_id}): {detail}")
-        return {"enabled": False, "reason": "update_ref_failed", "detail": detail}
-
-    return {
-        "enabled": True,
-        "repo_root": str(repo_root),
-        "baseline_ref": baseline_ref,
-        "baseline_oid": baseline_oid,
-        "baseline_source": baseline_source,
-    }
-
-
-def _cleanup_change_git_baseline(change: dict[str, Any]) -> None:
-    git_raw = change.get("git")
-    if not isinstance(git_raw, dict) or not bool(git_raw.get("enabled")):
-        return
-
-    repo_root_text = git_raw.get("repo_root")
-    baseline_ref = git_raw.get("baseline_ref")
-    if not isinstance(repo_root_text, str) or not repo_root_text:
-        return
-    if not isinstance(baseline_ref, str) or not baseline_ref:
-        return
-
-    code, _, stderr = _run_git_command(Path(repo_root_text).resolve(), ["update-ref", "-d", baseline_ref])
-    if code != 0:
-        detail = stderr or "unknown error"
-        _log(f"git baseline cleanup failed ({change.get('id', 'unknown')}): {detail}")
-
-
-def _rollback_snapshot_records(change: dict[str, Any]) -> int:
-    tracked_raw = change.get("tracked_paths")
-    tracked = tracked_raw if isinstance(tracked_raw, dict) else {}
-    records_raw = list(tracked.values())
-    records: list[dict[str, Any]] = [record for record in records_raw if isinstance(record, dict)]
-
-    records.sort(key=lambda item: len(Path(str(item.get("path", ""))).parts), reverse=True)
-
-    restore_errors: list[str] = []
-    restored_count = 0
-
-    for record in records:
-        path_text = str(record.get("path", "")).strip()
-        if not path_text:
-            continue
-
-        path = Path(path_text)
-        existed = bool(record.get("existed", False))
-        kind = str(record.get("kind", "missing"))
-
+    if PLAN_STORE_BACKUP_PATH.exists():
         try:
-            if path.exists():
-                _remove_path(path)
-
-            if existed:
-                backup_rel = record.get("backup_rel")
-                if not isinstance(backup_rel, str) or not backup_rel:
-                    raise ValueError("backup path missing")
-                backup_path = CHANGE_SNAPSHOT_ROOT / backup_rel
-                if not backup_path.exists():
-                    raise ValueError(f"backup not found: {backup_path}")
-
-                if kind == "directory":
-                    shutil.copytree(backup_path, path)
-                else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(backup_path, path)
-
-            restored_count += 1
+            backup_text = PLAN_STORE_BACKUP_PATH.read_text(encoding="utf-8", errors="replace")
+            backup_raw = json.loads(backup_text)
+            return _normalize_plan_store(backup_raw)
         except Exception as e:
-            restore_errors.append(f"{path}: {e}")
+            _log(f"plan guard backup load failed: {e}")
 
-    if restore_errors:
-        raise RuntimeError("rollback failed for some paths: " + " | ".join(restore_errors))
+    plan_markdown_path = _plan_markdown_path()
+    if plan_markdown_path.exists():
+        try:
+            markdown_text = plan_markdown_path.read_text(encoding="utf-8", errors="replace")
+            if markdown_text:
+                if _looks_like_legacy_plan_markdown(markdown_text):
+                    return _parse_legacy_plan_markdown(markdown_text)
+                return _sync_store_with_user_markdown(_default_plan_store(), markdown_text)
+        except Exception as e:
+            _log(f"plan guard markdown load failed: {e}")
 
-    return restored_count
-
-
-def _rollback_change_with_git(change: dict[str, Any]) -> None:
-    git_raw = change.get("git")
-    if not isinstance(git_raw, dict) or not bool(git_raw.get("enabled")):
-        raise ValueError("git metadata is missing for this change")
-
-    repo_root_text = git_raw.get("repo_root")
-    baseline_ref = git_raw.get("baseline_ref")
-    if not isinstance(repo_root_text, str) or not repo_root_text:
-        raise ValueError("git repo_root is missing")
-    if not isinstance(baseline_ref, str) or not baseline_ref:
-        raise ValueError("git baseline_ref is missing")
-
-    repo_root = Path(repo_root_text).resolve()
-    code, _, stderr = _run_git_command(repo_root, ["restore", "--source", baseline_ref, "--worktree", "--", "."])
-    if code != 0:
-        detail = stderr or "unknown error"
-        raise RuntimeError(f"git restore failed: {detail}")
+    return _default_plan_store()
 
 
-def _record_change_operation(tool_name: str, paths: list[Path], details: Optional[dict[str, Any]] = None) -> None:
-    state = _load_control_state()
-    active_change_id = state.get("active_change_id")
-    if not isinstance(active_change_id, str) or not active_change_id:
-        return
+def _latest_plan_id_from_store(store: dict[str, Any], include_archived: bool = False) -> Optional[str]:
+    normalized = _normalize_plan_store(store)
+    plans_raw = normalized.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+    order_raw = normalized.get("plan_order")
+    order = order_raw if isinstance(order_raw, list) else []
 
-    changes = state.get("changes")
-    if not isinstance(changes, dict):
-        return
-    change_raw = changes.get(active_change_id)
-    if not isinstance(change_raw, dict):
-        return
-    if str(change_raw.get("status", "active")) != "active":
-        return
-
-    mode = str(change_raw.get("mode", "snapshot")).strip().lower()
-    git_repo_root: Optional[Path] = None
-    git_raw = change_raw.get("git")
-    if mode == "git" and isinstance(git_raw, dict) and bool(git_raw.get("enabled")):
-        repo_root_text = git_raw.get("repo_root")
-        if isinstance(repo_root_text, str) and repo_root_text:
-            git_repo_root = Path(repo_root_text).resolve()
-
-    normalized_paths: list[str] = []
-    for path in paths:
-        resolved = path.resolve()
-        normalized_paths.append(str(resolved))
-        if mode == "git" and git_repo_root is not None and _is_subpath(resolved, git_repo_root):
+    for item in reversed(order):
+        if not isinstance(item, str):
             continue
-        _track_original_for_change(change_raw, resolved)
+        plan_id = item.strip()
+        if not plan_id:
+            continue
+        plan = plans.get(plan_id)
+        if not isinstance(plan, dict):
+            continue
+        if not include_archived and bool(plan.get("archived", False)):
+            continue
+        return plan_id
 
-    operations_raw = change_raw.get("operations")
-    operations: list[dict[str, Any]]
-    if isinstance(operations_raw, list):
-        operations = operations_raw
-    else:
-        operations = []
-        change_raw["operations"] = operations
+    return None
 
-    operation: dict[str, Any] = {
-        "time": _utc_now(),
-        "tool": tool_name,
-        "paths": normalized_paths,
-    }
-    if details is not None:
-        operation["details"] = details
-    operations.append(operation)
-    change_raw["updated_at"] = _utc_now()
 
+def _resolve_guard_plan_id(state: dict[str, Any], store: dict[str, Any]) -> tuple[Optional[str], bool]:
+    guard = _ensure_guard_policy_state(state)
+    normalized = _normalize_plan_store(store)
+    plans_raw = normalized.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+
+    current = guard.get("latest_plan_id")
+    if isinstance(current, str):
+        candidate = current.strip()
+        if candidate and isinstance(plans.get(candidate), dict):
+            return candidate, False
+
+    fallback = _latest_plan_id_from_store(normalized, include_archived=False)
+    if fallback is None:
+        fallback = _latest_plan_id_from_store(normalized, include_archived=True)
+
+    guard["latest_plan_id"] = fallback
+    return fallback, True
+
+
+def _set_latest_plan_guard(plan_id: str) -> None:
+    normalized_plan_id = _compact_text(plan_id, "")
+    if not normalized_plan_id:
+        return
+
+    state = _load_control_state()
+    guard = _ensure_guard_policy_state(state)
+    guard["latest_plan_id"] = normalized_plan_id
+    guard["continue_confirmed_plan_id"] = None
+    guard["continue_confirmed_at"] = None
+    guard["continue_confirmation_text"] = ""
+    _append_guard_audit(
+        state,
+        event="plan_created",
+        message=f"plan `{normalized_plan_id}` created; continue confirmation reset.",
+        tool="plan_create",
+        extra={"plan_id": normalized_plan_id},
+    )
     _save_control_state(state)
 
 
-def _change_payload(change: dict[str, Any], active_change_id: Optional[str] = None) -> dict[str, Any]:
-    tracked_raw = change.get("tracked_paths")
-    tracked = tracked_raw if isinstance(tracked_raw, dict) else {}
-    operations_raw = change.get("operations")
-    operations = operations_raw if isinstance(operations_raw, list) else []
+def _confirmation_contains_continue(text: str) -> bool:
+    compact = _compact_text(text, "").lower()
+    if not compact:
+        return False
+    return any(keyword in compact for keyword in CONTINUE_CONFIRM_KEYWORDS)
 
-    mode_raw = str(change.get("mode", "snapshot")).strip().lower()
-    mode = mode_raw if mode_raw in {"snapshot", "git"} else "snapshot"
-    git_raw = change.get("git")
-    git_enabled = bool(isinstance(git_raw, dict) and git_raw.get("enabled"))
-    git_repo_root = ""
-    if isinstance(git_raw, dict):
-        repo_root_text = git_raw.get("repo_root")
-        if isinstance(repo_root_text, str):
-            git_repo_root = repo_root_text
 
-    tracked_paths = list(tracked.keys())
-    lines = [
-        f"change_id: {change.get('id')}",
-        f"mode: {mode}",
-        f"status: {change.get('status', 'active')}",
-        f"tracked_paths: {len(tracked_paths)}",
-        f"operations: {len(operations)}",
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _path_from_workspace_uri(uri_text: str) -> Optional[Path]:
+    compact = _compact_text(uri_text, "")
+    if not compact:
+        return None
+
+    parsed = urlparse(compact)
+    if parsed.scheme and parsed.scheme.lower() != "file":
+        return None
+
+    if parsed.scheme.lower() == "file":
+        raw_path = unquote(parsed.path or "")
+        if os.name == "nt" and re.fullmatch(r"/[A-Za-z]:.*", raw_path):
+            raw_path = raw_path[1:]
+        if parsed.netloc and os.name == "nt":
+            host = parsed.netloc.strip()
+            if host and host.lower() not in {"", "localhost"}:
+                raw_path = f"//{host}{raw_path}"
+    else:
+        raw_path = compact
+
+    try:
+        return Path(raw_path).expanduser().resolve()
+    except Exception:
+        return None
+
+
+def _capture_runtime_workspace_hint(params: dict[str, Any]) -> None:
+    global _RUNTIME_WORKSPACE_ROOT_HINT
+
+    candidates: list[str] = []
+
+    def _add_candidate(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+
+    _add_candidate(params.get("rootPath"))
+    _add_candidate(params.get("rootUri"))
+
+    workspace_folders = params.get("workspaceFolders")
+    if isinstance(workspace_folders, list):
+        for item in workspace_folders:
+            if not isinstance(item, dict):
+                continue
+            _add_candidate(item.get("uri"))
+            _add_candidate(item.get("path"))
+
+    for meta_key in ("meta", "_meta"):
+        meta_obj = params.get(meta_key)
+        if not isinstance(meta_obj, dict):
+            continue
+        _add_candidate(meta_obj.get("rootPath"))
+        _add_candidate(meta_obj.get("rootUri"))
+
+    for candidate in candidates:
+        parsed = _path_from_workspace_uri(candidate)
+        if parsed is None:
+            continue
+        _RUNTIME_WORKSPACE_ROOT_HINT = str(parsed)
+        return
+
+
+def _resolve_runtime_workspace_root() -> Path:
+    env_override = os.environ.get("CODEXTOOLS_WORKSPACE_ROOT", "").strip()
+    if env_override:
+        return _path(env_override)
+
+    hint = _compact_text(_RUNTIME_WORKSPACE_ROOT_HINT, "")
+    if hint:
+        try:
+            return _path(hint)
+        except Exception:
+            pass
+
+    return WORKSPACE_ROOT
+
+
+def _capture_runtime_model_hint(params: dict[str, Any]) -> None:
+    global _RUNTIME_MODEL_HINT
+
+    hints: list[str] = []
+
+    def _add_hint(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        compact = _compact_text(value, "")
+        if compact:
+            hints.append(compact)
+
+    for key in ("model", "model_name", "modelName", "assistant_model", "assistantModel"):
+        _add_hint(params.get(key))
+
+    client_info = params.get("clientInfo")
+    if isinstance(client_info, dict):
+        for key in ("name", "title", "version", "model"):
+            _add_hint(client_info.get(key))
+
+    for meta_key in ("meta", "_meta"):
+        meta_obj = params.get(meta_key)
+        if not isinstance(meta_obj, dict):
+            continue
+        for key in ("model", "model_name", "modelName", "assistant_model", "assistantModel"):
+            _add_hint(meta_obj.get(key))
+
+    if hints:
+        _RUNTIME_MODEL_HINT = " ".join(dict.fromkeys(hints))
+
+
+def _load_model_hint_from_local_config() -> str:
+    workspace_root = _resolve_runtime_workspace_root()
+    config_candidates = (
+        workspace_root / "codex.config.codextools.toml",
+        workspace_root / "codex.config.toml",
+        PROJECT_ROOT / "codex.config.codextools.toml",
+        PROJECT_ROOT / "codex.config.toml",
+    )
+    for config_path in config_candidates:
+        if not config_path.exists():
+            continue
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        match = MODEL_LINE_PATTERN.search(config_text)
+        if not match:
+            continue
+
+        candidate = _compact_text(match.group(1), "")
+        if candidate:
+            return candidate
+
+    return ""
+
+
+def _resolve_agent_target_filename() -> str:
+    hints: list[str] = []
+
+    runtime_hint = _compact_text(_RUNTIME_MODEL_HINT, "")
+    if runtime_hint:
+        hints.append(runtime_hint)
+
+    config_hint = _load_model_hint_from_local_config()
+    if config_hint:
+        hints.append(config_hint)
+
+    for env_key in ("CODEX_MODEL", "MODEL", "OPENAI_MODEL", "ANTHROPIC_MODEL", "LLM_MODEL"):
+        env_value = os.environ.get(env_key)
+        if isinstance(env_value, str) and env_value.strip():
+            hints.append(env_value.strip())
+
+    merged_hint = " ".join(hints).lower()
+    if "claude" in merged_hint:
+        return "CLAUDE.MD"
+    if "codex" in merged_hint:
+        return "AGENTS.MD"
+    return "AGENTS.MD"
+
+
+def _load_agent_template_text(target_filename: str, workspace_root: Path) -> str:
+    target_path = workspace_root / target_filename
+    candidates: list[Path] = [
+        workspace_root / "AGENTS.MD",
+        workspace_root / "AGENTS.md",
+        PROJECT_ROOT / "AGENTS.MD",
+        PROJECT_ROOT / "AGENTS.md",
     ]
-    if git_enabled and git_repo_root:
-        lines.append(f"git_repo_root: {git_repo_root}")
+    if target_filename.upper() == "AGENTS.MD":
+        candidates.extend(
+            [
+                workspace_root / "CLAUDE.MD",
+                workspace_root / "CLAUDE.md",
+                PROJECT_ROOT / "CLAUDE.MD",
+                PROJECT_ROOT / "CLAUDE.md",
+            ]
+        )
 
-    for index, operation in enumerate(operations[-20:], start=max(1, len(operations) - 19)):
-        tool_name = str(operation.get("tool", ""))
-        op_paths = operation.get("paths")
-        path_count = len(op_paths) if isinstance(op_paths, list) else 0
-        lines.append(f"{index}. {tool_name} ({path_count} paths)")
+    seen: set[str] = set()
+    target_key = str(target_path).lower()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key == target_key or key in seen:
+            continue
+        seen.add(key)
 
+        if not candidate.exists():
+            continue
+
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        normalized = _normalize_newlines(text).strip()
+        if normalized:
+            return normalized + "\n"
+
+    return FALLBACK_AGENT_RULES_TEXT
+
+
+def _ensure_runtime_agent_file_ready() -> dict[str, Any]:
+    workspace_root = _resolve_runtime_workspace_root()
+    target_filename = _resolve_agent_target_filename()
+    target_path = workspace_root / target_filename
+
+    template_text = _load_agent_template_text(target_filename, workspace_root)
+    normalized_template = _normalize_newlines(template_text).strip()
+    if not normalized_template:
+        normalized_template = _normalize_newlines(FALLBACK_AGENT_RULES_TEXT).strip()
+
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    existed = target_path.exists()
+    existing_text = ""
+    if existed:
+        existing_text = target_path.read_text(encoding="utf-8", errors="replace")
+
+    normalized_existing = _normalize_newlines(existing_text)
+    if normalized_template and normalized_template in normalized_existing:
+        return {
+            "path": str(target_path),
+            "filename": target_filename,
+            "workspace_root": str(workspace_root),
+            "action": "already_present",
+        }
+
+    if AUTO_AGENT_BLOCK_START in normalized_existing and AUTO_AGENT_BLOCK_END in normalized_existing:
+        return {
+            "path": str(target_path),
+            "filename": target_filename,
+            "workspace_root": str(workspace_root),
+            "action": "already_appended",
+        }
+
+    if normalized_existing.strip():
+        append_block = (
+            f"{AUTO_AGENT_BLOCK_START}\n"
+            f"{normalized_template}\n"
+            f"{AUTO_AGENT_BLOCK_END}\n"
+        )
+        base_text = existing_text
+        if base_text and not base_text.endswith(("\n", "\r")):
+            base_text += "\n"
+        if base_text and not base_text.endswith("\n\n"):
+            base_text += "\n"
+        target_path.write_text(base_text + append_block, encoding="utf-8", newline="")
+        return {
+            "path": str(target_path),
+            "filename": target_filename,
+            "workspace_root": str(workspace_root),
+            "action": "appended",
+        }
+
+    final_text = f"{normalized_template}\n"
+    target_path.write_text(final_text, encoding="utf-8", newline="")
+    action = "created" if not existed else "initialized"
     return {
-        "id": change.get("id"),
-        "title": change.get("title", ""),
-        "description": change.get("description", ""),
-        "created_at": change.get("created_at"),
-        "updated_at": change.get("updated_at"),
-        "mode": mode,
-        "git_enabled": git_enabled,
-        "git_repo_root": git_repo_root if git_enabled else None,
-        "status": change.get("status", "active"),
-        "active": bool(active_change_id and change.get("id") == active_change_id),
-        "tracked_path_count": len(tracked_paths),
-        "tracked_paths": tracked_paths,
-        "operation_count": len(operations),
-        "operations": operations,
-        "visual": "\n".join(lines),
+        "path": str(target_path),
+        "filename": target_filename,
+        "workspace_root": str(workspace_root),
+        "action": action,
     }
 
 
-def tool_plan_create(args: dict[str, Any]) -> dict[str, Any]:
+def _enforce_agent_file_gate(tool_name: str) -> None:
+    try:
+        result = _ensure_runtime_agent_file_ready()
+    except Exception as e:
+        raise PermissionError(
+            f"Tool call blocked: failed to prepare AGENTS/CLAUDE file before `{tool_name}`: {e}"
+        ) from e
+
+    action = _compact_text(result.get("action"), "") if isinstance(result, dict) else ""
+    if action in {"created", "initialized", "appended"}:
+        state = _load_control_state()
+        _append_guard_audit(
+            state,
+            event="agent_file_prepared",
+            message=f"prepared {result.get('filename', 'AGENTS/CLAUDE')} in workspace.",
+            tool=tool_name,
+            extra={
+                "action": action,
+                "path": result.get("path"),
+                "workspace_root": result.get("workspace_root"),
+            },
+        )
+        _save_control_state(state)
+
+
+def _tokenize_proc_run_command(command: Any, shell_mode: bool) -> list[str]:
+    if isinstance(command, list):
+        if not all(isinstance(item, str) for item in command):
+            raise ValueError("`command` list must contain only strings")
+        return [item for item in command if item]
+
+    if isinstance(command, str):
+        if shell_mode:
+            return [command]
+        parsed = shlex.split(command, posix=False if os.name == "nt" else True)
+        return parsed if parsed else [command]
+
+    raise ValueError("`command` must be a string or string array")
+
+
+def _primary_command_name(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    head = tokens[0].strip().strip('"').strip("'")
+    if not head:
+        return ""
+    return Path(head).name.lower()
+
+
+def _mark_plan_continue_confirmed(
+    state: dict[str, Any],
+    *,
+    plan_id: str,
+    confirmation_text: str,
+    audit_event: str,
+    audit_tool: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> str:
+    now = _utc_now()
+    guard = _ensure_guard_policy_state(state)
+    guard["latest_plan_id"] = plan_id
+    guard["continue_confirmed_plan_id"] = plan_id
+    guard["continue_confirmed_at"] = now
+    guard["continue_confirmation_text"] = confirmation_text
+    _append_guard_audit(
+        state,
+        event=audit_event,
+        message=f"continue confirmed for plan `{plan_id}`.",
+        tool=audit_tool,
+        extra=extra or {"plan_id": plan_id},
+    )
+    return now
+
+
+def _open_plan_review_dialog(plan_id: str, store: dict[str, Any]) -> Optional[str]:
+    handler = TOOL_HANDLERS.get("ui_plan_confirm")
+    if handler is None:
+        return None
+
+    try:
+        normalized_store = _normalize_plan_store(store)
+        plan_text = _render_plan_markdown(normalized_store, include_archived=True, only_plan_id=plan_id)
+        plan_filename = _plan_markdown_path().name
+        payload = handler(
+            {
+                "title": "计划确认",
+                "prompt": f"请先阅读计划内容。若要调整请点击“修改计划”，改完 {plan_filename} 后再发送“继续”。",
+                "plan_content": plan_text,
+                "continue_label": "继续",
+                "modify_label": "修改计划",
+                "topmost": True,
+                "bring_to_front": True,
+                "focus_force": True,
+            }
+        )
+    except Exception as e:
+        _log(f"plan review dialog failed: {e}")
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    action = _compact_text(payload.get("action"), "").lower()
+    if action in {"continue", "modify", "closed"}:
+        return action
+    return None
+
+
+def _enforce_write_guard(tool_name: str) -> None:
+    store = _load_plan_store_for_guard()
+    state = _load_control_state()
+    guard = _ensure_guard_policy_state(state)
+
+    if not bool(guard.get("enforce_plan_for_writes", True)):
+        return
+
+    plan_id, changed = _resolve_guard_plan_id(state, store)
+    if not plan_id:
+        message = (
+            "Write blocked by plan-first policy: no plan exists. "
+            "Call `plan_create` first, then wait for user confirmation and call `plan_confirm_continue`."
+        )
+        _append_guard_audit(state, event="write_blocked_no_plan", message=message, tool=tool_name)
+        _save_control_state(state)
+        raise PermissionError(message)
+
+    confirmed_plan_id = _compact_text(guard.get("continue_confirmed_plan_id"), "")
+    if confirmed_plan_id != plan_id:
+        action = _open_plan_review_dialog(plan_id, store)
+        if action == "continue":
+            _mark_plan_continue_confirmed(
+                state,
+                plan_id=plan_id,
+                confirmation_text="dialog:continue",
+                audit_event="continue_confirmed_dialog",
+                audit_tool="ui_plan_confirm",
+                extra={"plan_id": plan_id, "source_tool": tool_name},
+            )
+            _save_control_state(state)
+            return
+
+        if action in {"modify", "closed"}:
+            plan_filename = _plan_markdown_path().name
+            message = (
+                f"Write blocked: plan `{plan_id}` requires review update. "
+                f"Please edit `{plan_filename}`, then send `继续` and call `plan_confirm_continue`."
+            )
+            _append_guard_audit(
+                state,
+                event="write_blocked_plan_modify",
+                message=message,
+                tool=tool_name,
+                extra={"required_plan_id": plan_id, "dialog_action": action},
+            )
+            _save_control_state(state)
+            raise PermissionError(message)
+
+        message = (
+            f"Write blocked by plan-first policy: plan `{plan_id}` is not confirmed. "
+            "After user explicitly says `continue` or `继续`, call `plan_confirm_continue`."
+        )
+        _append_guard_audit(
+            state,
+            event="write_blocked_no_continue",
+            message=message,
+            tool=tool_name,
+            extra={"required_plan_id": plan_id, "confirmed_plan_id": confirmed_plan_id or None},
+        )
+        _save_control_state(state)
+        raise PermissionError(message)
+
+    if changed:
+        _save_control_state(state)
+
+
+def _enforce_proc_run_policy(args: dict[str, Any]) -> None:
+    state = _load_control_state()
+    guard = _ensure_guard_policy_state(state)
+
+    if not bool(guard.get("enforce_proc_run_policy", True)):
+        return
+
+    reason = args.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        message = (
+            "proc_run blocked by policy: provide `reason` and explain why CodexTools fs tools are insufficient."
+        )
+        _append_guard_audit(state, event="proc_blocked_missing_reason", message=message, tool="proc_run")
+        _save_control_state(state)
+        raise PermissionError(message)
+
+    shell_mode = _as_bool(args.get("shell"), False)
+    command = args.get("command")
+    tokens = _tokenize_proc_run_command(command, shell_mode)
+    command_text = command if isinstance(command, str) else " ".join(tokens)
+
+    if shell_mode:
+        message = "proc_run blocked by policy: `shell=true` is disabled. Use shell=false and CodexTools fs tools."
+        _append_guard_audit(
+            state,
+            event="proc_blocked_shell_mode",
+            message=message,
+            tool="proc_run",
+            extra={"command": command_text},
+        )
+        _save_control_state(state)
+        raise PermissionError(message)
+
+    if isinstance(command_text, str) and PROC_RUN_REDIRECTION_PATTERN.search(command_text):
+        message = "proc_run blocked by policy: shell redirection or pipeline detected. Use CodexTools fs tools for file/text work."
+        _append_guard_audit(
+            state,
+            event="proc_blocked_redirection",
+            message=message,
+            tool="proc_run",
+            extra={"command": command_text},
+        )
+        _save_control_state(state)
+        raise PermissionError(message)
+
+    primary = _primary_command_name(tokens)
+    if primary in PROC_RUN_DENY_PRIMARY_COMMANDS:
+        message = (
+            f"proc_run blocked by policy: `{primary}` is reserved for file/text operations. "
+            "Use CodexTools fs tools instead."
+        )
+        _append_guard_audit(
+            state,
+            event="proc_blocked_file_text_command",
+            message=message,
+            tool="proc_run",
+            extra={"command": command_text, "primary": primary},
+        )
+        _save_control_state(state)
+        raise PermissionError(message)
+
+
+def _enforce_tool_policy(name: str, args: dict[str, Any]) -> None:
+    _enforce_agent_file_gate(name)
+
+    if name in WRITE_GUARDED_TOOLS:
+        _enforce_write_guard(name)
+        return
+
+    if name in {"proc_run", "debug_run", "perf_benchmark"}:
+        _enforce_proc_run_policy(args)
+
+
+
+def tool_plan_create(args: dict[str, Any]) -> str:
     title = _require_str(args, "title")
     steps_arg = args.get("steps")
     if not isinstance(steps_arg, list) or not steps_arg:
@@ -556,9 +1581,34 @@ def tool_plan_create(args: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(description, str):
         raise ValueError("`description` must be string")
 
+    normalized_title = title.strip()
     now = _utc_now()
-    state = _load_control_state()
-    plan_id = _next_identifier(state, "next_plan_seq", "plan")
+    store = _load_plan_store()
+
+    plans_raw = store.get("plans")
+    plans: dict[str, Any] = plans_raw if isinstance(plans_raw, dict) else {}
+    plan_order_raw = store.get("plan_order")
+    plan_order: list[str] = plan_order_raw if isinstance(plan_order_raw, list) else []
+
+    matched_plan_id: Optional[str] = None
+    for candidate_id in plan_order:
+        candidate_plan = plans.get(candidate_id)
+        if not isinstance(candidate_plan, dict):
+            continue
+        if _compact_text(candidate_plan.get("title"), "") == normalized_title:
+            matched_plan_id = candidate_id
+            break
+
+    if not matched_plan_id:
+        plan_id = _next_identifier(store, "next_plan_seq", "plan")
+        created_at = now
+        if plan_id not in plan_order:
+            plan_order.append(plan_id)
+            store["plan_order"] = plan_order
+    else:
+        plan_id = matched_plan_id
+        existing_plan = plans.get(plan_id)
+        created_at = _compact_text(existing_plan.get("created_at"), now) if isinstance(existing_plan, dict) else now
 
     steps: list[dict[str, Any]] = []
     for index, item in enumerate(steps_arg, start=1):
@@ -574,38 +1624,31 @@ def tool_plan_create(args: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    plan = {
+    plans[plan_id] = {
         "id": plan_id,
-        "title": title.strip(),
+        "title": normalized_title,
         "description": description,
-        "created_at": now,
+        "created_at": created_at,
         "updated_at": now,
         "archived": False,
         "steps": steps,
     }
+    store["plans"] = plans
 
-    plans_raw = state.get("plans")
-    plans: dict[str, Any] = plans_raw if isinstance(plans_raw, dict) else {}
-    plans[plan_id] = plan
-    state["plans"] = plans
+    store = _save_plan_store(store)
+    _set_latest_plan_guard(plan_id)
 
-    plan_order_raw = state.get("plan_order")
-    plan_order: list[str] = plan_order_raw if isinstance(plan_order_raw, list) else []
-    plan_order.append(plan_id)
-    state["plan_order"] = plan_order
-
-    _save_control_state(state)
-    return _plan_payload(plan)
+    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
 
 
-def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
+def tool_plan_update(args: dict[str, Any]) -> str:
     plan_id = _require_str(args, "plan_id")
 
     status_raw = args.get("status")
     if not isinstance(status_raw, str) or not status_raw.strip():
         raise ValueError("`status` must be a non-empty string")
-    status = status_raw.strip().lower()
-    if status not in PLAN_STEP_STATUSES:
+    status = _coerce_plan_status(status_raw)
+    if status_raw.strip().lower() not in PLAN_STEP_STATUSES:
         allowed = ", ".join(sorted(PLAN_STEP_STATUSES))
         raise ValueError(f"`status` must be one of: {allowed}")
 
@@ -620,8 +1663,8 @@ def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
 
     exclusive_in_progress = _as_bool(args.get("exclusive_in_progress"), True)
 
-    state = _load_control_state()
-    plan = _get_plan(state, plan_id)
+    store = _load_plan_store()
+    plan = _get_plan(store, plan_id)
     steps_raw = plan.get("steps")
     if not isinstance(steps_raw, list) or not steps_raw:
         raise ValueError(f"plan has no steps: {plan_id}")
@@ -631,7 +1674,7 @@ def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(step_id, str) or not step_id.strip():
             raise ValueError("`step_id` must be a non-empty string")
         for index, step in enumerate(steps_raw):
-            if str(step.get("id", "")) == step_id:
+            if str(step.get("id", "")).strip() == step_id.strip():
                 target_index = index
                 break
         if target_index < 0:
@@ -647,7 +1690,7 @@ def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
         for index, step in enumerate(steps_raw):
             if index == target_index:
                 continue
-            if str(step.get("status", "")).strip().lower() == "in_progress":
+            if _coerce_plan_status(step.get("status", "pending")) == "in_progress":
                 step["status"] = "pending"
                 step["updated_at"] = now
 
@@ -658,221 +1701,120 @@ def tool_plan_update(args: dict[str, Any]) -> dict[str, Any]:
         target_step["note"] = note
 
     plan["updated_at"] = now
-    _save_control_state(state)
-    return _plan_payload(plan)
+    store = _save_plan_store(store)
+    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
 
 
-def tool_plan_view(args: dict[str, Any]) -> dict[str, Any]:
+def tool_plan_view(args: dict[str, Any]) -> str:
     plan_id = _require_str(args, "plan_id")
-    state = _load_control_state()
-    plan = _get_plan(state, plan_id)
-    return _plan_payload(plan)
+    store = _load_plan_store()
+    _ = _get_plan(store, plan_id)
+    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
 
 
-def tool_plan_list(args: dict[str, Any]) -> dict[str, Any]:
+def tool_plan_list(args: dict[str, Any]) -> str:
     include_archived = _as_bool(args.get("include_archived"), False)
-
-    state = _load_control_state()
-    plans_raw = state.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-    order_raw = state.get("plan_order")
-    order = order_raw if isinstance(order_raw, list) else []
-
-    summaries: list[dict[str, Any]] = []
-    for plan_id in order:
-        plan = plans.get(plan_id)
-        if not isinstance(plan, dict):
-            continue
-        if not include_archived and bool(plan.get("archived", False)):
-            continue
-        summaries.append(_plan_summary(plan))
-
-    return {"count": len(summaries), "plans": summaries}
+    store = _load_plan_store()
+    return _render_plan_markdown(store, include_archived=include_archived)
 
 
-def tool_plan_archive(args: dict[str, Any]) -> dict[str, Any]:
+def tool_plan_archive(args: dict[str, Any]) -> str:
     plan_id = _require_str(args, "plan_id")
     archived = _as_bool(args.get("archived"), True)
 
-    state = _load_control_state()
-    plan = _get_plan(state, plan_id)
+    store = _load_plan_store()
+    plan = _get_plan(store, plan_id)
     plan["archived"] = archived
     plan["updated_at"] = _utc_now()
-    _save_control_state(state)
-    return _plan_payload(plan)
+    store = _save_plan_store(store)
+    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
 
 
-def tool_change_begin(args: dict[str, Any]) -> dict[str, Any]:
-    title = _require_str(args, "title")
-    description = args.get("description", "")
-    if not isinstance(description, str):
-        raise ValueError("`description` must be string")
+def tool_plan_confirm_continue(args: dict[str, Any]) -> dict[str, Any]:
+    confirmation = _require_str(args, "confirmation")
+    if not _confirmation_contains_continue(confirmation):
+        raise ValueError("`confirmation` must include `continue` or `继续`")
+
+    requested_plan_id = args.get("plan_id")
+    if requested_plan_id is not None and (not isinstance(requested_plan_id, str) or not requested_plan_id.strip()):
+        raise ValueError("`plan_id` must be a non-empty string when provided")
+
+    store = _load_plan_store_for_guard()
+    plan_id = requested_plan_id.strip() if isinstance(requested_plan_id, str) else ""
+    if plan_id:
+        _ = _get_plan(store, plan_id)
+    else:
+        plan_id = _latest_plan_id_from_store(store, include_archived=False) or ""
+        if not plan_id:
+            plan_id = _latest_plan_id_from_store(store, include_archived=True) or ""
+        if not plan_id:
+            raise ValueError("no plan found: call `plan_create` before confirmation")
 
     state = _load_control_state()
-    active_change_id = state.get("active_change_id")
-    if isinstance(active_change_id, str) and active_change_id:
-        active_change = state.get("changes", {}).get(active_change_id)
-        if isinstance(active_change, dict) and str(active_change.get("status", "active")) == "active":
-            raise ValueError(f"active change already exists: {active_change_id}")
+    now = _mark_plan_continue_confirmed(
+        state,
+        plan_id=plan_id,
+        confirmation_text=confirmation.strip(),
+        audit_event="continue_confirmed",
+        audit_tool="plan_confirm_continue",
+        extra={"plan_id": plan_id, "confirmation": confirmation.strip()},
+    )
+    _save_control_state(state)
 
-    change_id = _next_identifier(state, "next_change_seq", "change")
-    now = _utc_now()
-    change = {
-        "id": change_id,
-        "title": title.strip(),
-        "description": description,
-        "status": "active",
-        "created_at": now,
-        "updated_at": now,
-        "operations": [],
-        "tracked_paths": {},
-        "mode": "snapshot",
-        "git": {"enabled": False, "reason": "not_initialized"},
+    return {
+        "plan_id": plan_id,
+        "confirmed": True,
+        "confirmed_at": now,
+        "confirmation": confirmation.strip(),
+        "message": "Continue confirmation recorded; write tools are now allowed for this plan.",
     }
 
-    git_metadata = _init_change_git_metadata(change_id)
-    change["git"] = git_metadata
-    change["mode"] = "git" if bool(git_metadata.get("enabled")) else "snapshot"
 
-    changes_raw = state.get("changes")
-    changes: dict[str, Any] = changes_raw if isinstance(changes_raw, dict) else {}
-    changes[change_id] = change
-    state["changes"] = changes
+def tool_plan_guard_status(args: dict[str, Any]) -> dict[str, Any]:
+    tail = _as_int(args.get("tail"), 20, minimum=1, maximum=200)
 
-    change_order_raw = state.get("change_order")
-    change_order: list[str] = change_order_raw if isinstance(change_order_raw, list) else []
-    change_order.append(change_id)
-    state["change_order"] = change_order
+    store = _load_plan_store_for_guard()
+    normalized_store = _normalize_plan_store(store)
 
-    state["active_change_id"] = change_id
-    _save_control_state(state)
-    return _change_payload(change, active_change_id=change_id)
-
-
-def tool_change_set_active(args: dict[str, Any]) -> dict[str, Any]:
-    change_id = args.get("change_id")
-
-    state = _load_control_state()
-    if change_id is None:
-        state["active_change_id"] = None
-        _save_control_state(state)
-        return {"active_change_id": None}
-
-    if not isinstance(change_id, str) or not change_id.strip():
-        raise ValueError("`change_id` must be a non-empty string")
-
-    change = _get_change(state, change_id)
-    if str(change.get("status", "active")) != "active":
-        raise ValueError(f"change is not active: {change_id}")
-
-    state["active_change_id"] = change_id
-    _save_control_state(state)
-    return {"active_change_id": change_id}
-
-
-def tool_change_get(args: dict[str, Any]) -> dict[str, Any]:
-    change_id = _require_str(args, "change_id")
-    state = _load_control_state()
-    change = _get_change(state, change_id)
-    active_change_id = state.get("active_change_id") if isinstance(state.get("active_change_id"), str) else None
-    return _change_payload(change, active_change_id=active_change_id)
-
-
-def tool_change_list(args: dict[str, Any]) -> dict[str, Any]:
-    include_rolled_back = _as_bool(args.get("include_rolled_back"), True)
-
-    state = _load_control_state()
-    changes_raw = state.get("changes")
-    changes = changes_raw if isinstance(changes_raw, dict) else {}
-    order_raw = state.get("change_order")
+    plans_raw = normalized_store.get("plans")
+    plans = plans_raw if isinstance(plans_raw, dict) else {}
+    order_raw = normalized_store.get("plan_order")
     order = order_raw if isinstance(order_raw, list) else []
 
-    active_change_id = state.get("active_change_id") if isinstance(state.get("active_change_id"), str) else None
+    non_archived_count = 0
+    for plan_id in order:
+        plan = plans.get(plan_id)
+        if isinstance(plan, dict) and not bool(plan.get("archived", False)):
+            non_archived_count += 1
 
-    summaries: list[dict[str, Any]] = []
-    for change_id in order:
-        change = changes.get(change_id)
-        if not isinstance(change, dict):
-            continue
-        if not include_rolled_back and str(change.get("status", "")) == "rolled_back":
-            continue
-        payload = _change_payload(change, active_change_id=active_change_id)
-        payload.pop("operations", None)
-        payload.pop("tracked_paths", None)
-        payload.pop("visual", None)
-        summaries.append(payload)
-
-    return {"active_change_id": active_change_id, "count": len(summaries), "changes": summaries}
-
-
-def tool_change_commit(args: dict[str, Any]) -> dict[str, Any]:
     state = _load_control_state()
+    guard = _ensure_guard_policy_state(state)
+    latest_plan_id, changed = _resolve_guard_plan_id(state, normalized_store)
+    if changed:
+        _save_control_state(state)
 
-    change_id_arg = args.get("change_id")
-    if change_id_arg is None:
-        active_change_id = state.get("active_change_id")
-        if not isinstance(active_change_id, str) or not active_change_id:
-            raise ValueError("No active change. Provide `change_id`.")
-        change_id = active_change_id
-    else:
-        if not isinstance(change_id_arg, str) or not change_id_arg.strip():
-            raise ValueError("`change_id` must be a non-empty string")
-        change_id = change_id_arg
+    confirmed_plan_id = _compact_text(guard.get("continue_confirmed_plan_id"), "") or None
+    confirmed_at = _compact_text(guard.get("continue_confirmed_at"), "") or None
+    confirmation_text = _compact_text(guard.get("continue_confirmation_text"), "")
 
-    change = _get_change(state, change_id)
-    status = str(change.get("status", "active"))
-    if status == "rolled_back":
-        raise ValueError(f"cannot commit rolled back change: {change_id}")
+    audit_raw = guard.get("audit")
+    audit_entries = audit_raw if isinstance(audit_raw, list) else []
+    audit_tail = audit_entries[-tail:]
 
-    change["status"] = "committed"
-    change["updated_at"] = _utc_now()
-    _cleanup_change_git_baseline(change)
+    return {
+        "enforce_plan_for_writes": bool(guard.get("enforce_plan_for_writes", True)),
+        "enforce_proc_run_policy": bool(guard.get("enforce_proc_run_policy", True)),
+        "plan_count": len(order),
+        "non_archived_plan_count": non_archived_count,
+        "latest_plan_id": latest_plan_id,
+        "continue_confirmed_plan_id": confirmed_plan_id,
+        "continue_confirmed_at": confirmed_at,
+        "continue_confirmation_text": confirmation_text,
+        "continue_pending": bool(latest_plan_id and confirmed_plan_id != latest_plan_id),
+        "audit_count": len(audit_entries),
+        "audit_tail": audit_tail,
+    }
 
-    active_change_id = state.get("active_change_id")
-    if isinstance(active_change_id, str) and active_change_id == change_id:
-        state["active_change_id"] = None
-
-    _save_control_state(state)
-    return _change_payload(change, active_change_id=None)
-
-
-def tool_change_rollback(args: dict[str, Any]) -> dict[str, Any]:
-    state = _load_control_state()
-
-    change_id_arg = args.get("change_id")
-    if change_id_arg is None:
-        active_change_id = state.get("active_change_id")
-        if not isinstance(active_change_id, str) or not active_change_id:
-            raise ValueError("No active change. Provide `change_id`.")
-        change_id = active_change_id
-    else:
-        if not isinstance(change_id_arg, str) or not change_id_arg.strip():
-            raise ValueError("`change_id` must be a non-empty string")
-        change_id = change_id_arg
-
-    change = _get_change(state, change_id)
-    mode_raw = str(change.get("mode", "snapshot")).strip().lower()
-    mode = mode_raw if mode_raw in {"snapshot", "git"} else "snapshot"
-
-    if mode == "git":
-        _rollback_change_with_git(change)
-
-    restored_count = _rollback_snapshot_records(change)
-
-    change["status"] = "rolled_back"
-    change["updated_at"] = _utc_now()
-    change["rollback_restored_paths"] = restored_count
-    change["rollback_mode"] = mode
-    if mode == "git":
-        change["rollback_git_restore"] = True
-    _cleanup_change_git_baseline(change)
-
-    active_change_id = state.get("active_change_id")
-    if isinstance(active_change_id, str) and active_change_id == change_id:
-        state["active_change_id"] = None
-
-    _save_control_state(state)
-    return _change_payload(change, active_change_id=None)
 
 
 def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
@@ -1066,8 +2008,6 @@ def tool_fs_write_text(args: dict[str, Any]) -> dict[str, Any]:
     create_dirs = _as_bool(args.get("create_dirs"), True)
     encoding = str(args.get("encoding", "utf-8"))
 
-    _record_change_operation("fs_write_text", [path], {"append": append})
-
     if create_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1090,7 +2030,6 @@ def tool_fs_replace_text(args: dict[str, Any]) -> dict[str, Any]:
     available = text.count(old)
     replaced = min(available, count) if count else available
     updated = text.replace(old, new, count) if count else text.replace(old, new)
-    _record_change_operation("fs_replace_text", [path], {"count": count, "replacements": replaced})
     path.write_text(updated, encoding="utf-8", newline="")
 
     return {"path": str(path), "replacements": replaced}
@@ -1132,11 +2071,6 @@ def tool_fs_replace_regex(args: dict[str, Any]) -> dict[str, Any]:
     compiled = re.compile(pattern, flags=_parse_regex_flags(flags_text))
     text = path.read_text(encoding="utf-8", errors="replace")
     updated, replaced = compiled.subn(repl, text, count=count)
-    _record_change_operation(
-        "fs_replace_regex",
-        [path],
-        {"pattern": pattern, "flags": flags_text, "count": count, "replacements": replaced},
-    )
     path.write_text(updated, encoding="utf-8", newline="")
 
     return {
@@ -1172,11 +2106,6 @@ def tool_fs_patch_lines(args: dict[str, Any]) -> dict[str, Any]:
     replacement_lines = content.splitlines(keepends=True)
     removed = lines[start_line - 1 : end_line]
     updated_lines = lines[: start_line - 1] + replacement_lines + lines[end_line:]
-    _record_change_operation(
-        "fs_patch_lines",
-        [path],
-        {"start_line": start_line, "end_line": end_line, "removed_lines": len(removed), "added_lines": len(replacement_lines)},
-    )
     path.write_text("".join(updated_lines), encoding=encoding, newline="")
 
     return {
@@ -1419,7 +2348,6 @@ def tool_fs_delete(args: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return {"path": str(path), "deleted": False, "reason": "not found"}
 
-    _record_change_operation("fs_delete", [path], {"recursive": recursive})
     if path.is_dir():
         if recursive:
             shutil.rmtree(path)
@@ -1474,8 +2402,6 @@ def tool_fs_move(args: dict[str, Any]) -> dict[str, Any]:
     if dst.exists() and not overwrite:
         raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
 
-    tracked_paths = [dst] if copy else [src, dst]
-    _record_change_operation("fs_move", tracked_paths, {"copy": copy, "overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=copy, overwrite=overwrite)
 
 
@@ -1491,7 +2417,6 @@ def tool_fs_move_file(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"destination is a directory: {dst}")
     if dst.exists() and not overwrite:
         raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
-    _record_change_operation("fs_move_file", [src, dst], {"overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=False, overwrite=overwrite)
 
 
@@ -1507,7 +2432,6 @@ def tool_fs_copy_file(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"destination is a directory: {dst}")
     if dst.exists() and not overwrite:
         raise ValueError(f"destination exists: {dst}. Set overwrite=true to replace.")
-    _record_change_operation("fs_copy_file", [dst], {"overwrite": overwrite})
     return _move_or_copy_path(src, dst, copy=True, overwrite=overwrite)
 
 
@@ -1526,7 +2450,6 @@ def tool_fs_create(args: dict[str, Any]) -> dict[str, Any]:
             if path.is_dir():
                 return {"path": str(path), "kind": "directory", "created": False, "exists": True}
             raise ValueError(f"path exists and is not a directory: {path}")
-        _record_change_operation("fs_create", [path], {"kind": "directory", "parents": parents})
         path.mkdir(parents=parents, exist_ok=False)
         return {"path": str(path), "kind": "directory", "created": True, "exists": True}
 
@@ -1538,7 +2461,6 @@ def tool_fs_create(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"path exists and is a directory: {path}")
     if existed and not overwrite:
         raise ValueError(f"file exists: {path}. Set overwrite=true to replace.")
-    _record_change_operation("fs_create", [path], {"kind": "file", "overwrite": overwrite})
     if parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     written = path.write_text(content, encoding=encoding, newline="")
@@ -1577,6 +2499,7 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
     if "command" not in args:
         raise ValueError("`command` is required")
 
+    reason = _require_str(args, "reason")
     shell_mode = _as_bool(args.get("shell"), False)
     command = _normalize_command(args["command"], shell_mode)
     timeout_sec = _as_int(args.get("timeout_sec"), 60, minimum=1, maximum=600)
@@ -1608,6 +2531,7 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "command": command,
             "shell": shell_mode,
+            "reason": reason,
             "cwd": str(cwd_path) if cwd_path else None,
             "timed_out": False,
             "duration_ms": int((time.time() - started) * 1000),
@@ -1621,6 +2545,7 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "command": command,
             "shell": shell_mode,
+            "reason": reason,
             "cwd": str(cwd_path) if cwd_path else None,
             "timed_out": True,
             "duration_ms": int((time.time() - started) * 1000),
@@ -1632,6 +2557,7 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "command": command,
             "shell": shell_mode,
+            "reason": reason,
             "cwd": str(cwd_path) if cwd_path else None,
             "timed_out": False,
             "duration_ms": int((time.time() - started) * 1000),
@@ -1644,6 +2570,12 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
 def tool_img_draw(args: dict[str, Any]) -> dict[str, Any]:
     try:
         from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        install_package_with_pip("pillow", "img_draw")
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception as e:
+            raise RuntimeError(f"Pillow is required: {e}") from e
     except Exception as e:
         raise RuntimeError(f"Pillow is required: {e}") from e
 
@@ -1730,7 +2662,6 @@ def tool_img_draw(args: dict[str, Any]) -> dict[str, Any]:
     if fmt in {"JPEG", "BMP"} and img.mode == "RGBA":
         img = img.convert("RGB")
 
-    _record_change_operation("img_draw", [path], {"format": fmt, "width": width, "height": height})
     img.save(path, format=fmt)
     return {
         "path": str(path),
@@ -1767,7 +2698,7 @@ def tool_sound_beep(args: dict[str, Any]) -> dict[str, Any]:
     return {"played": True, "mode": mode, "frequency": freq, "duration_ms": duration, "repeat": repeat}
 
 
-TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Union[dict[str, Any], str]]] = {
     "fs_read_text": tool_fs_read_text,
     "fs_read_texts": tool_fs_read_texts,
     "fs_write_text": tool_fs_write_text,
@@ -1788,12 +2719,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "plan_view": tool_plan_view,
     "plan_list": tool_plan_list,
     "plan_archive": tool_plan_archive,
-    "change_begin": tool_change_begin,
-    "change_set_active": tool_change_set_active,
-    "change_get": tool_change_get,
-    "change_list": tool_change_list,
-    "change_commit": tool_change_commit,
-    "change_rollback": tool_change_rollback,
+    "plan_confirm_continue": tool_plan_confirm_continue,
+    "plan_guard_status": tool_plan_guard_status,
     "proc_run": tool_proc_run,
     "img_draw": tool_img_draw,
     "sound_beep": tool_sound_beep,
@@ -1816,18 +2743,14 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "fs_move_file": "Move a single file from source to destination.",
     "fs_copy_file": "Copy a single file from source to destination.",
     "fs_create": "Create a file or directory. Use kind=file|dir.",
-    "plan_create": "Create a progress plan with named steps.",
-    "plan_update": "Update status/note for a plan step and return visualization.",
-    "plan_view": "View one plan with a textual progress visualization.",
-    "plan_list": "List plans with progress summaries.",
-    "plan_archive": "Archive or unarchive a plan.",
-    "change_begin": "Start an active change set. Uses git baseline restore when available, otherwise file snapshots.",
-    "change_set_active": "Set or clear the active change set used for auto-tracking.",
-    "change_get": "Show tracked files/operations for one change set.",
-    "change_list": "List change sets and their status.",
-    "change_commit": "Finalize a change set without rollback or automatic git commit.",
-    "change_rollback": "Rollback a change set to begin state using git baseline restore or snapshot fallback.",
-    "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Use this for npm, npx, git, python, and any CLI tool.",
+    "plan_create": "Create a plan group and persist it to root markdown file `<project>-plan.md`.",
+    "plan_update": "Update one plan step and sync markdown checklist state.",
+    "plan_view": "View one plan group from markdown checklist store.",
+    "plan_list": "List plan groups from markdown checklist store.",
+    "plan_archive": "Archive or unarchive one markdown plan group.",
+    "plan_confirm_continue": "Record explicit user continue confirmation for a plan before write tools are allowed.",
+    "plan_guard_status": "View plan-first/write guard state and recent policy audit events.",
+    "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Requires `reason` and blocks shell/file-text operations that should use fs tools.",
     "img_draw": "Draw an image with primitive shapes (line, rect, ellipse, text, polygon). Requires Pillow.",
     "sound_beep": "Play a beep notification sound.",
 }
@@ -2087,48 +3010,19 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["plan_id"],
         "additionalProperties": False,
     },
-    "change_begin": {
+    "plan_confirm_continue": {
         "type": "object",
         "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string", "default": ""},
+            "confirmation": {"type": "string"},
+            "plan_id": {"type": "string"},
         },
-        "required": ["title"],
+        "required": ["confirmation"],
         "additionalProperties": False,
     },
-    "change_set_active": {
+    "plan_guard_status": {
         "type": "object",
         "properties": {
-            "change_id": {"type": "string"},
-        },
-        "additionalProperties": False,
-    },
-    "change_get": {
-        "type": "object",
-        "properties": {
-            "change_id": {"type": "string"},
-        },
-        "required": ["change_id"],
-        "additionalProperties": False,
-    },
-    "change_list": {
-        "type": "object",
-        "properties": {
-            "include_rolled_back": {"type": "boolean", "default": True},
-        },
-        "additionalProperties": False,
-    },
-    "change_commit": {
-        "type": "object",
-        "properties": {
-            "change_id": {"type": "string"},
-        },
-        "additionalProperties": False,
-    },
-    "change_rollback": {
-        "type": "object",
-        "properties": {
-            "change_id": {"type": "string"},
+            "tail": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
         },
         "additionalProperties": False,
     },
@@ -2136,12 +3030,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {
             "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+            "reason": {"type": "string", "description": "Explain why CodexTools fs tools are insufficient for this command."},
             "cwd": {"type": "string"},
             "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
             "shell": {"type": "boolean", "default": False},
             "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables to set"},
         },
-        "required": ["command"],
+        "required": ["command", "reason"],
         "additionalProperties": False,
     },
     "img_draw": {
@@ -2168,6 +3063,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": False,
     },
 }
+
+_EXTENSION_HANDLERS, _EXTENSION_DESCRIPTIONS, _EXTENSION_SCHEMAS = get_extension_tooling()
+for _tool_name in _EXTENSION_HANDLERS.keys():
+    if _tool_name in TOOL_HANDLERS:
+        raise ValueError(f"extension tool conflicts with built-in tool: {_tool_name}")
+
+TOOL_HANDLERS.update(_EXTENSION_HANDLERS)
+TOOL_DESCRIPTIONS.update(_EXTENSION_DESCRIPTIONS)
+TOOL_SCHEMAS.update(_EXTENSION_SCHEMAS)
+
 
 def _read_message(stdin: Any) -> Tuple[Optional[dict[str, Any]], str]:
     """
@@ -2229,6 +3134,8 @@ def _handle(method: str, params: dict[str, Any]) -> Optional[dict[str, Any]]:
         protocol = params.get("protocolVersion")
         if not isinstance(protocol, str) or not protocol:
             protocol = DEFAULT_PROTOCOL_VERSION
+        _capture_runtime_model_hint(params)
+        _capture_runtime_workspace_hint(params)
         return {
             "protocolVersion": protocol,
             "capabilities": {"tools": {"listChanged": False}},
@@ -2262,6 +3169,7 @@ def _handle(method: str, params: dict[str, Any]) -> Optional[dict[str, Any]]:
         if handler is None:
             return _tool_error(f"unknown tool: {name}")
         try:
+            _enforce_tool_policy(name, args)
             return _ok(handler(args))
         except Exception as e:
             _log(f"tool failed ({name}): {e}")

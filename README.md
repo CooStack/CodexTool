@@ -2,61 +2,11 @@
 
 CodexTools 是一个基于 Python 的 MCP 工具服务，提供 UTF-8 文本读写、限量读取、批量搜索、批量替换、目录操作、命令执行、图片绘制和提示音能力。
 
-## 当前目录与迁移说明
+## 策略约束
 
-本项目已按你的要求迁移到根目录路径：`D:/python/CodexTools`。
-
-旧路径（已移除）：`D:/python/CodexTools/utf8_tools_mcp/`
-
-当前核心文件：
-
-- `D:/python/CodexTools/server.py`
-- `D:/python/CodexTools/AGENT_RULES.md`
-- `D:/python/CodexTools/examples/`
-- `D:/python/CodexTools/codex.config.codextools.toml`
-- `D:/python/CodexTools/mcp.codextools.json`
-
-## 工具列表
-
-- `fs_read_text`
-- `fs_read_texts`
-- `fs_write_text`
-- `fs_replace_text`
-- `fs_replace_regex`
-- `fs_patch_lines`
-- `fs_list`
-- `fs_list_files`
-- `fs_search_text`
-- `fs_stat`
-- `fs_delete`
-- `fs_move`
-- `fs_move_file`
-- `fs_copy_file`
-- `fs_create`
-- `plan_create`
-- `plan_update`
-- `plan_view`
-- `plan_list`
-- `plan_archive`
-- `change_begin`
-- `change_set_active`
-- `change_get`
-- `change_list`
-- `change_commit`
-- `change_rollback`
-- `proc_run`
-- `img_draw`
-- `sound_beep`
-
-## 计划可视化与变更回滚
-
-典型流程：
-
-1. `plan_create` 创建任务步骤。
-2. 执行过程中用 `plan_update` 更新步骤状态，用 `plan_view`/`plan_list` 查看进度可视化。
-3. 需要可撤回时先调用 `change_begin`，后续文件修改会自动记录快照。
-4. 用 `change_get`/`change_list` 查看本次改动。
-5. 确认后 `change_commit`，或用 `change_rollback` 一键回滚。
+- `tools/call` 放行前会先确保规则文件存在：Claude 模型使用 `CLAUDE.MD`，Codex/其他模型使用 `AGENTS.MD`。
+- 规则文件默认写入当前工作区根目录（优先 `initialize.rootUri/workspaceFolders`，其次 `CODEXTOOLS_WORKSPACE_ROOT`，再兜底服务启动工作目录）。
+- 若目标规则文件为空则直接创建；若已有内容则仅在缺失时追加，并避免重复追加。
 
 ## 启动
 
@@ -64,11 +14,54 @@ CodexTools 是一个基于 Python 的 MCP 工具服务，提供 UTF-8 文本读�
 python -u -X utf8 D:/python/CodexTools/server.py
 ```
 
-可选依赖（仅 `img_draw` 需要）：
+依赖安装：
+
+- 默认会在首次调用相关工具时自动尝试 `pip` 安装缺失依赖（使用当前 Python 解释器执行 `python -m pip install ...`）。
+- 也可以提前手动安装，避免首次调用等待：
 
 ```powershell
-python -m pip install pillow
+python -m pip install pillow matplotlib playwright
 ```
+
+- `img_draw` 依赖 `pillow`（缺失时自动安装）
+- `ui_line_chart` 依赖 `matplotlib`（缺失时自动安装）
+- 浏览器调试工具依赖 `playwright`（缺失时自动安装包；浏览器二进制仍需按提示执行 `playwright install`）
+- `ui_dialog_input` 使用 `tkinter`（Python 标准库，需系统图形界面可用）
+
+## 用户输入交互（ui_dialog_input）
+
+默认是手动交互模式（不会自动提交），会尝试置顶并抢焦点，适合真实用户输入场景。
+
+手动交互示例：
+
+```json
+{
+  "title": "请输入审批意见",
+  "prompt": "请填写说明后点击按钮",
+  "button1_label": "提交",
+  "button2_label": "取消"
+}
+```
+
+自动化测试示例（仅测试时使用）：
+
+```json
+{
+  "title": "自动化测试",
+  "prompt": "该窗口将自动提交",
+  "default": "test",
+  "auto_submit_after_ms": 200,
+  "auto_button": "button1"
+}
+```
+
+## 计划确认弹窗（继续/修改）
+
+当计划未确认时，写操作闸门会优先弹出计划确认窗口（`ui_plan_confirm`）：
+- 点击“继续”：立即确认当前计划并继续执行。
+- 点击“修改计划”：阻断写操作，按提示直接编辑当前工作区根目录下的 `<工作区名>-plan.md`，修改后再发送“继续”并调用 `plan_confirm_continue`。
+
+该弹窗默认手动交互，不自动提交。
 
 ## MCP 配置（JSON）
 
