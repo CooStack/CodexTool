@@ -10,8 +10,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
+import urllib.request
+import zipfile
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from typing import Any, Callable, Optional, Tuple, Union
@@ -130,7 +133,6 @@ WORKSPACE_ROOT = _resolve_workspace_root()
 WORKSPACE_STATE_KEY = _workspace_state_key(WORKSPACE_ROOT)
 STATE_ROOT = PROJECT_ROOT / ".agent" / "state" / WORKSPACE_STATE_KEY
 CONTROL_STATE_PATH = STATE_ROOT / "codextools_control_state.json"
-PLAN_STORE_BACKUP_PATH = STATE_ROOT / "codextools_plan_store.json"
 
 
 def _runtime_project_name() -> str:
@@ -143,34 +145,6 @@ def _runtime_project_name() -> str:
     return candidate if candidate else PROJECT_NAME
 
 
-def _plan_markdown_path() -> Path:
-    try:
-        workspace_root = _resolve_runtime_workspace_root()
-    except Exception:
-        workspace_root = WORKSPACE_ROOT
-    return workspace_root / f"{_runtime_project_name()}-plan.md"
-
-PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "blocked", "canceled"}
-LEGACY_PLAN_STORE_META_PATTERN = re.compile(r"^\s*<!--\s*plan-store-meta:([A-Za-z0-9+/=]+)\s*-->\s*$")
-LEGACY_PLAN_GROUP_META_PATTERN = re.compile(r"^\s*<!--\s*plan-meta:([A-Za-z0-9+/=]+)\s*-->\s*$")
-LEGACY_PLAN_STEP_META_PATTERN = re.compile(
-    r"^\s*-\s*\[( |x)\]\s*(.*?)\s*<!--\s*step-meta:([A-Za-z0-9+/=]+)\s*-->\s*$"
-)
-PLAN_SECTION_PATTERN = re.compile(r"^\s*##\s+(.+?)\s*$")
-PLAN_CHECKBOX_PATTERN = re.compile(r"^\s*-\s*\[( |x|X)\]\s*(.*?)\s*$")
-
-WRITE_GUARDED_TOOLS = {
-    "fs_write_text",
-    "fs_replace_text",
-    "fs_replace_regex",
-    "fs_patch_lines",
-    "fs_delete",
-    "fs_move",
-    "fs_move_file",
-    "fs_copy_file",
-    "fs_create",
-    "img_draw",
-}
 PROC_RUN_DENY_PRIMARY_COMMANDS = {
     "cat",
     "type",
@@ -197,7 +171,6 @@ PROC_RUN_DENY_PRIMARY_COMMANDS = {
     "ni",
 }
 PROC_RUN_REDIRECTION_PATTERN = re.compile(r"(?:^|\s)(?:\|>|>>|<|<<|1>|2>|1>>|2>>)(?:\s|$)")
-CONTINUE_CONFIRM_KEYWORDS = ("continue", "继续")
 MODEL_LINE_PATTERN = re.compile(r"(?m)^\s*model\s*=\s*[\"']([^\"']+)[\"']\s*$")
 AUTO_AGENT_BLOCK_START = "<!-- codextools:auto-agent-rules:v1:start -->"
 AUTO_AGENT_BLOCK_END = "<!-- codextools:auto-agent-rules:v1:end -->"
@@ -216,12 +189,7 @@ def _ensure_control_paths() -> None:
 
 def _default_guard_policy_state() -> dict[str, Any]:
     return {
-        "enforce_plan_for_writes": True,
         "enforce_proc_run_policy": True,
-        "latest_plan_id": None,
-        "continue_confirmed_plan_id": None,
-        "continue_confirmed_at": None,
-        "continue_confirmation_text": "",
         "audit": [],
     }
 
@@ -231,22 +199,7 @@ def _normalize_guard_policy_state(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return guard
 
-    guard["enforce_plan_for_writes"] = bool(raw.get("enforce_plan_for_writes", True))
     guard["enforce_proc_run_policy"] = bool(raw.get("enforce_proc_run_policy", True))
-
-    latest_plan_id = raw.get("latest_plan_id")
-    guard["latest_plan_id"] = latest_plan_id if isinstance(latest_plan_id, str) and latest_plan_id.strip() else None
-
-    confirmed_plan_id = raw.get("continue_confirmed_plan_id")
-    guard["continue_confirmed_plan_id"] = (
-        confirmed_plan_id if isinstance(confirmed_plan_id, str) and confirmed_plan_id.strip() else None
-    )
-
-    confirmed_at = raw.get("continue_confirmed_at")
-    guard["continue_confirmed_at"] = confirmed_at if isinstance(confirmed_at, str) and confirmed_at.strip() else None
-
-    confirmation_text = raw.get("continue_confirmation_text")
-    guard["continue_confirmation_text"] = confirmation_text if isinstance(confirmation_text, str) else ""
 
     audit_raw = raw.get("audit")
     if isinstance(audit_raw, list):
@@ -317,20 +270,7 @@ def _default_control_state() -> dict[str, Any]:
         "version": 1,
         "workspace_root": str(WORKSPACE_ROOT),
         "workspace_state_key": WORKSPACE_STATE_KEY,
-        "next_plan_seq": 1,
-        "plans": {},
-        "plan_order": [],
         "guard_policy": _default_guard_policy_state(),
-    }
-
-
-def _default_plan_store() -> dict[str, Any]:
-    return {
-        "version": 1,
-        "project_name": _runtime_project_name(),
-        "next_plan_seq": 1,
-        "plans": {},
-        "plan_order": [],
     }
 
 
@@ -352,10 +292,6 @@ def _load_control_state() -> dict[str, Any]:
         if key in loaded:
             state[key] = loaded[key]
 
-    if not isinstance(state.get("plans"), dict):
-        state["plans"] = {}
-    if not isinstance(state.get("plan_order"), list):
-        state["plan_order"] = []
     state["workspace_root"] = str(WORKSPACE_ROOT)
     state["workspace_state_key"] = WORKSPACE_STATE_KEY
 
@@ -403,656 +339,6 @@ def _compact_text(value: Any, fallback: str = "") -> str:
     text = value if isinstance(value, str) else str(value)
     compact = " ".join(part for part in text.splitlines() if part.strip())
     return compact.strip() or fallback
-
-
-def _decode_legacy_plan_meta(token: str) -> Optional[dict[str, Any]]:
-    try:
-        raw = base64.b64decode(token.encode("ascii"), validate=True).decode("utf-8")
-        loaded = json.loads(raw)
-    except Exception:
-        return None
-    return loaded if isinstance(loaded, dict) else None
-
-
-def _normalize_plan_store(store_raw: Any) -> dict[str, Any]:
-    default_now = _utc_now()
-    store = _default_plan_store()
-
-    if isinstance(store_raw, dict):
-        for key in ("version", "project_name", "next_plan_seq", "plans", "plan_order"):
-            if key in store_raw:
-                store[key] = store_raw[key]
-
-    try:
-        version = int(store.get("version", 1))
-    except Exception:
-        version = 1
-    if version < 1:
-        version = 1
-
-    project_name_raw = store.get("project_name")
-    project_name = project_name_raw.strip() if isinstance(project_name_raw, str) else ""
-    if not project_name:
-        project_name = _runtime_project_name()
-
-    plans_input = store.get("plans")
-    plans_input_dict = plans_input if isinstance(plans_input, dict) else {}
-
-    plans: dict[str, Any] = {}
-    for raw_plan_key, raw_plan in plans_input_dict.items():
-        if not isinstance(raw_plan, dict):
-            continue
-
-        fallback_plan_id = str(raw_plan_key).strip()
-        plan_id_value = raw_plan.get("id", fallback_plan_id)
-        plan_id = str(plan_id_value).strip()
-        if not plan_id:
-            continue
-
-        plan_created = _compact_text(raw_plan.get("created_at"), default_now)
-        plan_updated = _compact_text(raw_plan.get("updated_at"), plan_created)
-        plan_title = _compact_text(raw_plan.get("title"), plan_id)
-        description_raw = raw_plan.get("description", "")
-        description = description_raw if isinstance(description_raw, str) else str(description_raw)
-
-        steps_out: list[dict[str, Any]] = []
-        steps_raw = raw_plan.get("steps")
-        if isinstance(steps_raw, list):
-            for index, step_raw in enumerate(steps_raw, start=1):
-                if not isinstance(step_raw, dict):
-                    continue
-
-                step_id_value = step_raw.get("id", f"{plan_id}-step-{index}")
-                step_id = _compact_text(step_id_value, f"{plan_id}-step-{index}")
-                step_title = _compact_text(step_raw.get("title"), f"Step {index}")
-                step_status = _coerce_plan_status(step_raw.get("status", "pending"))
-                step_note_raw = step_raw.get("note", "")
-                step_note = step_note_raw if isinstance(step_note_raw, str) else str(step_note_raw)
-                step_updated = _compact_text(step_raw.get("updated_at"), plan_updated)
-
-                steps_out.append(
-                    {
-                        "id": step_id,
-                        "title": step_title,
-                        "status": step_status,
-                        "note": step_note,
-                        "updated_at": step_updated,
-                    }
-                )
-
-        plans[plan_id] = {
-            "id": plan_id,
-            "title": plan_title,
-            "description": description,
-            "created_at": plan_created,
-            "updated_at": plan_updated,
-            "archived": bool(raw_plan.get("archived", False)),
-            "steps": steps_out,
-        }
-
-    order_input = store.get("plan_order")
-    order: list[str] = []
-    if isinstance(order_input, list):
-        for item in order_input:
-            if not isinstance(item, str):
-                continue
-            plan_id = item.strip()
-            if not plan_id or plan_id not in plans or plan_id in order:
-                continue
-            order.append(plan_id)
-
-    for plan_id in plans.keys():
-        if plan_id not in order:
-            order.append(plan_id)
-
-    raw_next_seq = store.get("next_plan_seq", 1)
-    try:
-        next_seq = int(raw_next_seq)
-    except Exception:
-        next_seq = 1
-    if next_seq < 1:
-        next_seq = 1
-
-    max_existing_seq = 0
-    for plan_id in plans.keys():
-        matched = re.fullmatch(r"plan-(\d+)", plan_id)
-        if not matched:
-            continue
-        max_existing_seq = max(max_existing_seq, int(matched.group(1)))
-
-    if next_seq <= max_existing_seq:
-        next_seq = max_existing_seq + 1
-
-    return {
-        "version": version,
-        "project_name": project_name,
-        "next_plan_seq": next_seq,
-        "plans": plans,
-        "plan_order": order,
-    }
-
-
-def _next_step_identifier(plan_id: str, steps: list[dict[str, Any]]) -> str:
-    max_index = 0
-    pattern = re.compile(rf"^{re.escape(plan_id)}-step-(\d+)$")
-    for step in steps:
-        step_id = _compact_text(step.get("id"), "")
-        matched = pattern.fullmatch(step_id)
-        if not matched:
-            continue
-        max_index = max(max_index, int(matched.group(1)))
-    return f"{plan_id}-step-{max_index + 1}"
-
-
-def _cleanup_plan_title_for_user_view(title: str) -> str:
-    compact = _compact_text(title, "")
-    parts = [part.strip() for part in compact.split("|")]
-    if len(parts) >= 3 and re.fullmatch(r"[A-Z]+计划组", parts[0]) and re.fullmatch(r"plan-\d+", parts[1]):
-        return _compact_text(parts[-1], compact)
-    return compact
-
-
-def _cleanup_step_title_for_user_view(title: str) -> str:
-    cleaned = _compact_text(title, "")
-
-    if "<!--" in cleaned:
-        cleaned = cleaned.split("<!--", 1)[0].strip()
-    if "| note:" in cleaned:
-        cleaned = cleaned.split("| note:", 1)[0].strip()
-
-    cleaned = re.sub(r"\(`plan-\d+-step-\d+`\)", "", cleaned).strip()
-    cleaned = re.sub(r"\[(已完成|进行中|待办|阻塞|已取消)\]", "", cleaned).strip()
-    return cleaned
-
-
-def _parse_simple_plan_markdown(text: str) -> list[dict[str, Any]]:
-    plans: list[dict[str, Any]] = []
-    current: Optional[dict[str, Any]] = None
-
-    for raw_line in text.splitlines():
-        section_match = PLAN_SECTION_PATTERN.match(raw_line)
-        if section_match:
-            title = _cleanup_plan_title_for_user_view(section_match.group(1))
-            if current and _compact_text(current.get("title"), ""):
-                plans.append(current)
-            current = {"title": title, "description": "", "steps": []}
-            continue
-
-        if current is None:
-            continue
-
-        stripped = raw_line.strip()
-        if stripped.startswith("- 描述:"):
-            current["description"] = stripped.split(":", 1)[1].strip()
-            continue
-
-        checkbox_match = PLAN_CHECKBOX_PATTERN.match(raw_line)
-        if checkbox_match:
-            step_title = _cleanup_step_title_for_user_view(checkbox_match.group(2))
-            if not step_title:
-                continue
-            current_steps = current.get("steps")
-            if isinstance(current_steps, list):
-                current_steps.append(
-                    {
-                        "title": step_title,
-                        "completed": checkbox_match.group(1).lower() == "x",
-                    }
-                )
-
-    if current and _compact_text(current.get("title"), ""):
-        plans.append(current)
-
-    return plans
-def _parse_legacy_plan_markdown(text: str) -> dict[str, Any]:
-    raw_store = _default_plan_store()
-    plans: dict[str, Any] = {}
-    plan_order: list[str] = []
-    current_plan_id: Optional[str] = None
-
-    for line in text.splitlines():
-        matched_store_meta = LEGACY_PLAN_STORE_META_PATTERN.match(line)
-        if matched_store_meta:
-            decoded = _decode_legacy_plan_meta(matched_store_meta.group(1))
-            if isinstance(decoded, dict):
-                if "version" in decoded:
-                    raw_store["version"] = decoded["version"]
-                if "project_name" in decoded:
-                    raw_store["project_name"] = decoded["project_name"]
-                if "next_plan_seq" in decoded:
-                    raw_store["next_plan_seq"] = decoded["next_plan_seq"]
-            continue
-
-        matched_plan_meta = LEGACY_PLAN_GROUP_META_PATTERN.match(line)
-        if matched_plan_meta:
-            decoded = _decode_legacy_plan_meta(matched_plan_meta.group(1))
-            if not isinstance(decoded, dict):
-                current_plan_id = None
-                continue
-
-            plan_id_raw = decoded.get("id")
-            if not isinstance(plan_id_raw, str) or not plan_id_raw.strip():
-                current_plan_id = None
-                continue
-
-            plan_id = plan_id_raw.strip()
-            plan_data = dict(decoded)
-            plan_data["id"] = plan_id
-            plan_data["steps"] = []
-            plans[plan_id] = plan_data
-            if plan_id not in plan_order:
-                plan_order.append(plan_id)
-            current_plan_id = plan_id
-            continue
-
-        matched_step_meta = LEGACY_PLAN_STEP_META_PATTERN.match(line)
-        if matched_step_meta and current_plan_id:
-            visible_title = _compact_text(matched_step_meta.group(2), "")
-            decoded = _decode_legacy_plan_meta(matched_step_meta.group(3))
-            step_data = dict(decoded) if isinstance(decoded, dict) else {}
-            if not _compact_text(step_data.get("title"), ""):
-                step_data["title"] = visible_title
-
-            current_plan = plans.get(current_plan_id)
-            if isinstance(current_plan, dict):
-                current_steps = current_plan.get("steps")
-                if isinstance(current_steps, list):
-                    current_steps.append(step_data)
-
-    raw_store["plans"] = plans
-    raw_store["plan_order"] = plan_order
-    return _normalize_plan_store(raw_store)
-
-
-def _looks_like_legacy_plan_markdown(text: str) -> bool:
-    return "<!-- plan-meta:" in text or "<!-- step-meta:" in text or "<!-- plan-store-meta:" in text
-
-
-def _sync_store_with_user_markdown(store: dict[str, Any], markdown_text: str) -> dict[str, Any]:
-    normalized = _normalize_plan_store(store)
-    user_plans = _parse_simple_plan_markdown(markdown_text)
-
-    plans_raw = normalized.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-    order_raw = normalized.get("plan_order")
-    order = order_raw if isinstance(order_raw, list) else []
-
-    title_queues: dict[str, list[str]] = {}
-    for plan_id in order:
-        plan = plans.get(plan_id)
-        if not isinstance(plan, dict):
-            continue
-        title = _compact_text(plan.get("title"), plan_id)
-        title_queues.setdefault(title, []).append(plan_id)
-
-    used_plan_ids: set[str] = set()
-    new_plans: dict[str, Any] = {}
-    new_order: list[str] = []
-    now = _utc_now()
-
-    for user_plan in user_plans:
-        user_title = _compact_text(user_plan.get("title"), "")
-        if not user_title:
-            continue
-
-        matched_plan_id: Optional[str] = None
-        queued = title_queues.get(user_title, [])
-        while queued:
-            candidate = queued.pop(0)
-            if candidate in used_plan_ids:
-                continue
-            matched_plan_id = candidate
-            break
-
-        existing_plan = plans.get(matched_plan_id) if isinstance(matched_plan_id, str) else None
-        if not isinstance(existing_plan, dict):
-            matched_plan_id = _next_identifier(normalized, "next_plan_seq", "plan")
-            existing_plan = None
-
-        assert isinstance(matched_plan_id, str)
-        used_plan_ids.add(matched_plan_id)
-
-        description_raw = user_plan.get("description", "")
-        description = description_raw if isinstance(description_raw, str) else str(description_raw)
-
-        existing_steps_raw = existing_plan.get("steps") if isinstance(existing_plan, dict) else []
-        existing_steps = existing_steps_raw if isinstance(existing_steps_raw, list) else []
-
-        used_step_indexes: set[int] = set()
-        new_steps: list[dict[str, Any]] = []
-        user_steps_raw = user_plan.get("steps")
-        user_steps = user_steps_raw if isinstance(user_steps_raw, list) else []
-
-        for user_step in user_steps:
-            step_title = _compact_text(user_step.get("title"), "")
-            if not step_title:
-                continue
-            checked = bool(user_step.get("completed", False))
-
-            matched_step_index = -1
-            matched_step: Optional[dict[str, Any]] = None
-            for idx, old_step in enumerate(existing_steps):
-                if idx in used_step_indexes or not isinstance(old_step, dict):
-                    continue
-                if _compact_text(old_step.get("title"), "") == step_title:
-                    matched_step_index = idx
-                    matched_step = old_step
-                    break
-
-            if matched_step_index >= 0 and isinstance(matched_step, dict):
-                used_step_indexes.add(matched_step_index)
-                step_id = _compact_text(matched_step.get("id"), _next_step_identifier(matched_plan_id, existing_steps + new_steps))
-                previous_status = _coerce_plan_status(matched_step.get("status", "pending"))
-                if checked:
-                    step_status = "completed"
-                elif previous_status == "completed":
-                    step_status = "pending"
-                else:
-                    step_status = previous_status
-
-                step_note_raw = matched_step.get("note", "")
-                step_note = step_note_raw if isinstance(step_note_raw, str) else str(step_note_raw)
-                step_updated = _compact_text(matched_step.get("updated_at"), now)
-                if step_status != previous_status:
-                    step_updated = now
-            else:
-                step_id = _next_step_identifier(matched_plan_id, existing_steps + new_steps)
-                step_status = "completed" if checked else "pending"
-                step_note = ""
-                step_updated = now
-
-            new_steps.append(
-                {
-                    "id": step_id,
-                    "title": step_title,
-                    "status": step_status,
-                    "note": step_note,
-                    "updated_at": step_updated,
-                }
-            )
-
-        if isinstance(existing_plan, dict):
-            created_at = _compact_text(existing_plan.get("created_at"), now)
-            archived = bool(existing_plan.get("archived", False))
-            previous_compare = [
-                (_compact_text(step.get("title"), ""), _coerce_plan_status(step.get("status", "pending")))
-                for step in existing_steps
-                if isinstance(step, dict)
-            ]
-            new_compare = [
-                (_compact_text(step.get("title"), ""), _coerce_plan_status(step.get("status", "pending")))
-                for step in new_steps
-            ]
-            title_changed = _compact_text(existing_plan.get("title"), "") != user_title
-            desc_changed = _compact_text(existing_plan.get("description"), "") != _compact_text(description, "")
-            steps_changed = previous_compare != new_compare
-            updated_at = now if (title_changed or desc_changed or steps_changed) else _compact_text(existing_plan.get("updated_at"), created_at)
-        else:
-            created_at = now
-            updated_at = now
-            archived = False
-
-        plan_payload = {
-            "id": matched_plan_id,
-            "title": user_title,
-            "description": description,
-            "created_at": created_at,
-            "updated_at": updated_at,
-            "archived": archived,
-            "steps": new_steps,
-        }
-
-        new_plans[matched_plan_id] = plan_payload
-        new_order.append(matched_plan_id)
-
-    normalized["plans"] = new_plans
-    normalized["plan_order"] = new_order
-    return _normalize_plan_store(normalized)
-
-
-def _render_plan_group_markdown(plan: dict[str, Any]) -> list[str]:
-    plan_title = _compact_text(plan.get("title"), "未命名计划")
-    description = _compact_text(plan.get("description"), "")
-
-    lines = [f"## {plan_title}"]
-    if description:
-        lines.append(f"- 描述: {description}")
-
-    steps_raw = plan.get("steps")
-    steps = steps_raw if isinstance(steps_raw, list) else []
-    if not steps:
-        lines.append("- [ ] (暂无任务)")
-        return lines
-
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        step_title = _compact_text(step.get("title"), "")
-        if not step_title:
-            continue
-        checked = _coerce_plan_status(step.get("status", "pending")) == "completed"
-        lines.append(f"- [{'x' if checked else ' '}] {step_title}")
-
-    if len(lines) == 1:
-        lines.append("- [ ] (暂无任务)")
-
-    return lines
-
-
-def _iter_plan_groups(store: dict[str, Any], include_archived: bool) -> list[tuple[str, dict[str, Any]]]:
-    plans_raw = store.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-    order_raw = store.get("plan_order")
-    order = order_raw if isinstance(order_raw, list) else []
-
-    groups: list[tuple[str, dict[str, Any]]] = []
-    for plan_id in order:
-        plan = plans.get(plan_id)
-        if not isinstance(plan, dict):
-            continue
-        if not include_archived and bool(plan.get("archived", False)):
-            continue
-        groups.append((plan_id, plan))
-
-    return groups
-
-
-def _render_plan_markdown(
-    store: dict[str, Any],
-    include_archived: bool,
-    only_plan_id: Optional[str] = None,
-) -> str:
-    normalized = _normalize_plan_store(store)
-    groups = _iter_plan_groups(normalized, include_archived=include_archived)
-
-    project_name_raw = normalized.get("project_name")
-    project_name = project_name_raw.strip() if isinstance(project_name_raw, str) else ""
-    if not project_name:
-        project_name = _runtime_project_name()
-
-    lines = [
-        f"# {project_name}-plan",
-    ]
-
-    has_output = False
-    for plan_id, plan in groups:
-        if only_plan_id is not None and plan_id != only_plan_id:
-            continue
-        lines.append("")
-        lines.extend(_render_plan_group_markdown(plan))
-        has_output = True
-
-    if not has_output:
-        lines.extend(["", "_暂无计划组_"])
-
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _save_plan_store(store: dict[str, Any]) -> dict[str, Any]:
-    normalized = _normalize_plan_store(store)
-    _ensure_control_paths()
-    PLAN_STORE_BACKUP_PATH.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8", newline="")
-    rendered = _render_plan_markdown(normalized, include_archived=True)
-    plan_markdown_path = _plan_markdown_path()
-    plan_markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    plan_markdown_path.write_text(rendered, encoding="utf-8", newline="")
-    return normalized
-
-
-def _migrate_plan_store_from_control_state() -> dict[str, Any]:
-    control_state = _load_control_state()
-    raw_store = {
-        "version": 1,
-        "project_name": _runtime_project_name(),
-        "next_plan_seq": control_state.get("next_plan_seq", 1),
-        "plans": control_state.get("plans", {}),
-        "plan_order": control_state.get("plan_order", []),
-    }
-    return _normalize_plan_store(raw_store)
-
-
-def _load_plan_store() -> dict[str, Any]:
-    _ensure_control_paths()
-
-    plan_markdown_path = _plan_markdown_path()
-    markdown_text = ""
-    if plan_markdown_path.exists():
-        try:
-            markdown_text = plan_markdown_path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            _log(f"plan markdown read failed: {e}")
-            markdown_text = ""
-
-    if PLAN_STORE_BACKUP_PATH.exists():
-        try:
-            backup_text = PLAN_STORE_BACKUP_PATH.read_text(encoding="utf-8", errors="replace")
-            backup_raw = json.loads(backup_text)
-            store = _normalize_plan_store(backup_raw)
-        except Exception as e:
-            _log(f"plan backup load failed, fallback migration: {e}")
-            store = _migrate_plan_store_from_control_state()
-
-        if markdown_text:
-            store = _sync_store_with_user_markdown(store, markdown_text)
-        return _save_plan_store(store)
-
-    if markdown_text and _looks_like_legacy_plan_markdown(markdown_text):
-        store = _parse_legacy_plan_markdown(markdown_text)
-        return _save_plan_store(store)
-
-    if markdown_text:
-        seed = _default_plan_store()
-        store = _sync_store_with_user_markdown(seed, markdown_text)
-        return _save_plan_store(store)
-
-    store = _migrate_plan_store_from_control_state()
-    return _save_plan_store(store)
-
-
-def _get_plan(store: dict[str, Any], plan_id: str) -> dict[str, Any]:
-    plans = store.get("plans")
-    if not isinstance(plans, dict):
-        raise ValueError("plan storage is not initialized")
-    plan = plans.get(plan_id)
-    if not isinstance(plan, dict):
-        raise ValueError(f"plan not found: {plan_id}")
-    return plan
-
-
-def _load_plan_store_for_guard() -> dict[str, Any]:
-    _ensure_control_paths()
-
-    if PLAN_STORE_BACKUP_PATH.exists():
-        try:
-            backup_text = PLAN_STORE_BACKUP_PATH.read_text(encoding="utf-8", errors="replace")
-            backup_raw = json.loads(backup_text)
-            return _normalize_plan_store(backup_raw)
-        except Exception as e:
-            _log(f"plan guard backup load failed: {e}")
-
-    plan_markdown_path = _plan_markdown_path()
-    if plan_markdown_path.exists():
-        try:
-            markdown_text = plan_markdown_path.read_text(encoding="utf-8", errors="replace")
-            if markdown_text:
-                if _looks_like_legacy_plan_markdown(markdown_text):
-                    return _parse_legacy_plan_markdown(markdown_text)
-                return _sync_store_with_user_markdown(_default_plan_store(), markdown_text)
-        except Exception as e:
-            _log(f"plan guard markdown load failed: {e}")
-
-    return _default_plan_store()
-
-
-def _latest_plan_id_from_store(store: dict[str, Any], include_archived: bool = False) -> Optional[str]:
-    normalized = _normalize_plan_store(store)
-    plans_raw = normalized.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-    order_raw = normalized.get("plan_order")
-    order = order_raw if isinstance(order_raw, list) else []
-
-    for item in reversed(order):
-        if not isinstance(item, str):
-            continue
-        plan_id = item.strip()
-        if not plan_id:
-            continue
-        plan = plans.get(plan_id)
-        if not isinstance(plan, dict):
-            continue
-        if not include_archived and bool(plan.get("archived", False)):
-            continue
-        return plan_id
-
-    return None
-
-
-def _resolve_guard_plan_id(state: dict[str, Any], store: dict[str, Any]) -> tuple[Optional[str], bool]:
-    guard = _ensure_guard_policy_state(state)
-    normalized = _normalize_plan_store(store)
-    plans_raw = normalized.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-
-    current = guard.get("latest_plan_id")
-    if isinstance(current, str):
-        candidate = current.strip()
-        if candidate and isinstance(plans.get(candidate), dict):
-            return candidate, False
-
-    fallback = _latest_plan_id_from_store(normalized, include_archived=False)
-    if fallback is None:
-        fallback = _latest_plan_id_from_store(normalized, include_archived=True)
-
-    guard["latest_plan_id"] = fallback
-    return fallback, True
-
-
-def _set_latest_plan_guard(plan_id: str) -> None:
-    normalized_plan_id = _compact_text(plan_id, "")
-    if not normalized_plan_id:
-        return
-
-    state = _load_control_state()
-    guard = _ensure_guard_policy_state(state)
-    guard["latest_plan_id"] = normalized_plan_id
-    guard["continue_confirmed_plan_id"] = None
-    guard["continue_confirmed_at"] = None
-    guard["continue_confirmation_text"] = ""
-    _append_guard_audit(
-        state,
-        event="plan_created",
-        message=f"plan `{normalized_plan_id}` created; continue confirmation reset.",
-        tool="plan_create",
-        extra={"plan_id": normalized_plan_id},
-    )
-    _save_control_state(state)
-
-
-def _confirmation_contains_continue(text: str) -> bool:
-    compact = _compact_text(text, "").lower()
-    if not compact:
-        return False
-    return any(keyword in compact for keyword in CONTINUE_CONFIRM_KEYWORDS)
 
 
 def _normalize_newlines(text: str) -> str:
@@ -1371,132 +657,6 @@ def _primary_command_name(tokens: list[str]) -> str:
     return Path(head).name.lower()
 
 
-def _mark_plan_continue_confirmed(
-    state: dict[str, Any],
-    *,
-    plan_id: str,
-    confirmation_text: str,
-    audit_event: str,
-    audit_tool: str,
-    extra: Optional[dict[str, Any]] = None,
-) -> str:
-    now = _utc_now()
-    guard = _ensure_guard_policy_state(state)
-    guard["latest_plan_id"] = plan_id
-    guard["continue_confirmed_plan_id"] = plan_id
-    guard["continue_confirmed_at"] = now
-    guard["continue_confirmation_text"] = confirmation_text
-    _append_guard_audit(
-        state,
-        event=audit_event,
-        message=f"continue confirmed for plan `{plan_id}`.",
-        tool=audit_tool,
-        extra=extra or {"plan_id": plan_id},
-    )
-    return now
-
-
-def _open_plan_review_dialog(plan_id: str, store: dict[str, Any]) -> Optional[str]:
-    handler = TOOL_HANDLERS.get("ui_plan_confirm")
-    if handler is None:
-        return None
-
-    try:
-        normalized_store = _normalize_plan_store(store)
-        plan_text = _render_plan_markdown(normalized_store, include_archived=True, only_plan_id=plan_id)
-        plan_filename = _plan_markdown_path().name
-        payload = handler(
-            {
-                "title": "计划确认",
-                "prompt": f"请先阅读计划内容。若要调整请点击“修改计划”，改完 {plan_filename} 后再发送“继续”。",
-                "plan_content": plan_text,
-                "continue_label": "继续",
-                "modify_label": "修改计划",
-                "topmost": True,
-                "bring_to_front": True,
-                "focus_force": True,
-            }
-        )
-    except Exception as e:
-        _log(f"plan review dialog failed: {e}")
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    action = _compact_text(payload.get("action"), "").lower()
-    if action in {"continue", "modify", "closed"}:
-        return action
-    return None
-
-
-def _enforce_write_guard(tool_name: str) -> None:
-    store = _load_plan_store_for_guard()
-    state = _load_control_state()
-    guard = _ensure_guard_policy_state(state)
-
-    if not bool(guard.get("enforce_plan_for_writes", True)):
-        return
-
-    plan_id, changed = _resolve_guard_plan_id(state, store)
-    if not plan_id:
-        message = (
-            "Write blocked by plan-first policy: no plan exists. "
-            "Call `plan_create` first, then wait for user confirmation and call `plan_confirm_continue`."
-        )
-        _append_guard_audit(state, event="write_blocked_no_plan", message=message, tool=tool_name)
-        _save_control_state(state)
-        raise PermissionError(message)
-
-    confirmed_plan_id = _compact_text(guard.get("continue_confirmed_plan_id"), "")
-    if confirmed_plan_id != plan_id:
-        action = _open_plan_review_dialog(plan_id, store)
-        if action == "continue":
-            _mark_plan_continue_confirmed(
-                state,
-                plan_id=plan_id,
-                confirmation_text="dialog:continue",
-                audit_event="continue_confirmed_dialog",
-                audit_tool="ui_plan_confirm",
-                extra={"plan_id": plan_id, "source_tool": tool_name},
-            )
-            _save_control_state(state)
-            return
-
-        if action in {"modify", "closed"}:
-            plan_filename = _plan_markdown_path().name
-            message = (
-                f"Write blocked: plan `{plan_id}` requires review update. "
-                f"Please edit `{plan_filename}`, then send `继续` and call `plan_confirm_continue`."
-            )
-            _append_guard_audit(
-                state,
-                event="write_blocked_plan_modify",
-                message=message,
-                tool=tool_name,
-                extra={"required_plan_id": plan_id, "dialog_action": action},
-            )
-            _save_control_state(state)
-            raise PermissionError(message)
-
-        message = (
-            f"Write blocked by plan-first policy: plan `{plan_id}` is not confirmed. "
-            "After user explicitly says `continue` or `继续`, call `plan_confirm_continue`."
-        )
-        _append_guard_audit(
-            state,
-            event="write_blocked_no_continue",
-            message=message,
-            tool=tool_name,
-            extra={"required_plan_id": plan_id, "confirmed_plan_id": confirmed_plan_id or None},
-        )
-        _save_control_state(state)
-        raise PermissionError(message)
-
-    if changed:
-        _save_control_state(state)
-
-
 def _enforce_proc_run_policy(args: dict[str, Any]) -> None:
     state = _load_control_state()
     guard = _ensure_guard_policy_state(state)
@@ -1562,271 +722,56 @@ def _enforce_proc_run_policy(args: dict[str, Any]) -> None:
 def _enforce_tool_policy(name: str, args: dict[str, Any]) -> None:
     _enforce_agent_file_gate(name)
 
-    if name in WRITE_GUARDED_TOOLS:
-        _enforce_write_guard(name)
-        return
-
     if name in {"proc_run", "debug_run", "perf_benchmark"}:
         _enforce_proc_run_policy(args)
 
 
 
-def tool_plan_create(args: dict[str, Any]) -> str:
-    title = _require_str(args, "title")
-    steps_arg = args.get("steps")
-    if not isinstance(steps_arg, list) or not steps_arg:
-        raise ValueError("`steps` must be a non-empty string array")
-
-    description = args.get("description", "")
-    if not isinstance(description, str):
-        raise ValueError("`description` must be string")
-
-    normalized_title = title.strip()
-    now = _utc_now()
-    store = _load_plan_store()
-
-    plans_raw = store.get("plans")
-    plans: dict[str, Any] = plans_raw if isinstance(plans_raw, dict) else {}
-    plan_order_raw = store.get("plan_order")
-    plan_order: list[str] = plan_order_raw if isinstance(plan_order_raw, list) else []
-
-    matched_plan_id: Optional[str] = None
-    for candidate_id in plan_order:
-        candidate_plan = plans.get(candidate_id)
-        if not isinstance(candidate_plan, dict):
-            continue
-        if _compact_text(candidate_plan.get("title"), "") == normalized_title:
-            matched_plan_id = candidate_id
-            break
-
-    if not matched_plan_id:
-        plan_id = _next_identifier(store, "next_plan_seq", "plan")
-        created_at = now
-        if plan_id not in plan_order:
-            plan_order.append(plan_id)
-            store["plan_order"] = plan_order
-    else:
-        plan_id = matched_plan_id
-        existing_plan = plans.get(plan_id)
-        created_at = _compact_text(existing_plan.get("created_at"), now) if isinstance(existing_plan, dict) else now
-
-    steps: list[dict[str, Any]] = []
-    for index, item in enumerate(steps_arg, start=1):
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError(f"`steps[{index - 1}]` must be a non-empty string")
-        steps.append(
-            {
-                "id": f"{plan_id}-step-{index}",
-                "title": item.strip(),
-                "status": "pending",
-                "note": "",
-                "updated_at": now,
-            }
-        )
-
-    plans[plan_id] = {
-        "id": plan_id,
-        "title": normalized_title,
-        "description": description,
-        "created_at": created_at,
-        "updated_at": now,
-        "archived": False,
-        "steps": steps,
-    }
-    store["plans"] = plans
-
-    store = _save_plan_store(store)
-    _set_latest_plan_guard(plan_id)
-
-    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
+_JAR_TEXT_FILE_SUFFIXES: tuple[str, ...] = (
+    ".java",
+    ".kt",
+    ".kts",
+    ".groovy",
+    ".scala",
+    ".xml",
+    ".properties",
+    ".mf",
+    ".txt",
+    ".md",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".sql",
+)
 
 
-def tool_plan_update(args: dict[str, Any]) -> str:
-    plan_id = _require_str(args, "plan_id")
-
-    status_raw = args.get("status")
-    if not isinstance(status_raw, str) or not status_raw.strip():
-        raise ValueError("`status` must be a non-empty string")
-    status = _coerce_plan_status(status_raw)
-    if status_raw.strip().lower() not in PLAN_STEP_STATUSES:
-        allowed = ", ".join(sorted(PLAN_STEP_STATUSES))
-        raise ValueError(f"`status` must be one of: {allowed}")
-
-    step_id = args.get("step_id")
-    step_index_arg = args.get("step_index")
-    if step_id is None and step_index_arg is None:
-        raise ValueError("Provide either `step_id` or `step_index`")
-
-    note = args.get("note")
-    if note is not None and not isinstance(note, str):
-        raise ValueError("`note` must be string")
-
-    exclusive_in_progress = _as_bool(args.get("exclusive_in_progress"), True)
-
-    store = _load_plan_store()
-    plan = _get_plan(store, plan_id)
-    steps_raw = plan.get("steps")
-    if not isinstance(steps_raw, list) or not steps_raw:
-        raise ValueError(f"plan has no steps: {plan_id}")
-
-    target_index = -1
-    if step_id is not None:
-        if not isinstance(step_id, str) or not step_id.strip():
-            raise ValueError("`step_id` must be a non-empty string")
-        for index, step in enumerate(steps_raw):
-            if str(step.get("id", "")).strip() == step_id.strip():
-                target_index = index
-                break
-        if target_index < 0:
-            raise ValueError(f"step not found: {step_id}")
-    else:
-        step_index = _as_int(step_index_arg, 1, minimum=1)
-        if step_index > len(steps_raw):
-            raise ValueError("`step_index` is out of range")
-        target_index = step_index - 1
-
-    now = _utc_now()
-    if status == "in_progress" and exclusive_in_progress:
-        for index, step in enumerate(steps_raw):
-            if index == target_index:
-                continue
-            if _coerce_plan_status(step.get("status", "pending")) == "in_progress":
-                step["status"] = "pending"
-                step["updated_at"] = now
-
-    target_step = steps_raw[target_index]
-    target_step["status"] = status
-    target_step["updated_at"] = now
-    if note is not None:
-        target_step["note"] = note
-
-    plan["updated_at"] = now
-    store = _save_plan_store(store)
-    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
+def _normalize_jar_entry_name(entry_text: str) -> str:
+    entry_name = entry_text.strip().replace("\\", "/").lstrip("/")
+    if not entry_name:
+        raise ValueError("jar entry path must be a non-empty string")
+    return entry_name
 
 
-def tool_plan_view(args: dict[str, Any]) -> str:
-    plan_id = _require_str(args, "plan_id")
-    store = _load_plan_store()
-    _ = _get_plan(store, plan_id)
-    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
+def _split_jar_path_and_entry(path_text: str) -> tuple[Path, Optional[str]]:
+    raw = path_text.strip()
+    for marker in ("!/", "!\\"):
+        if marker in raw:
+            jar_text, entry_text = raw.split(marker, 1)
+            jar_path = _path(jar_text)
+            if jar_path.suffix.lower() != ".jar":
+                raise ValueError("archive entry syntax requires a `.jar` path before `!/`")
+            return jar_path, _normalize_jar_entry_name(entry_text)
+    return _path(raw), None
 
 
-def tool_plan_list(args: dict[str, Any]) -> str:
-    include_archived = _as_bool(args.get("include_archived"), False)
-    store = _load_plan_store()
-    return _render_plan_markdown(store, include_archived=include_archived)
-
-
-def tool_plan_archive(args: dict[str, Any]) -> str:
-    plan_id = _require_str(args, "plan_id")
-    archived = _as_bool(args.get("archived"), True)
-
-    store = _load_plan_store()
-    plan = _get_plan(store, plan_id)
-    plan["archived"] = archived
-    plan["updated_at"] = _utc_now()
-    store = _save_plan_store(store)
-    return _render_plan_markdown(store, include_archived=True, only_plan_id=plan_id)
-
-
-def tool_plan_confirm_continue(args: dict[str, Any]) -> dict[str, Any]:
-    confirmation = _require_str(args, "confirmation")
-    if not _confirmation_contains_continue(confirmation):
-        raise ValueError("`confirmation` must include `continue` or `继续`")
-
-    requested_plan_id = args.get("plan_id")
-    if requested_plan_id is not None and (not isinstance(requested_plan_id, str) or not requested_plan_id.strip()):
-        raise ValueError("`plan_id` must be a non-empty string when provided")
-
-    store = _load_plan_store_for_guard()
-    plan_id = requested_plan_id.strip() if isinstance(requested_plan_id, str) else ""
-    if plan_id:
-        _ = _get_plan(store, plan_id)
-    else:
-        plan_id = _latest_plan_id_from_store(store, include_archived=False) or ""
-        if not plan_id:
-            plan_id = _latest_plan_id_from_store(store, include_archived=True) or ""
-        if not plan_id:
-            raise ValueError("no plan found: call `plan_create` before confirmation")
-
-    state = _load_control_state()
-    now = _mark_plan_continue_confirmed(
-        state,
-        plan_id=plan_id,
-        confirmation_text=confirmation.strip(),
-        audit_event="continue_confirmed",
-        audit_tool="plan_confirm_continue",
-        extra={"plan_id": plan_id, "confirmation": confirmation.strip()},
-    )
-    _save_control_state(state)
-
-    return {
-        "plan_id": plan_id,
-        "confirmed": True,
-        "confirmed_at": now,
-        "confirmation": confirmation.strip(),
-        "message": "Continue confirmation recorded; write tools are now allowed for this plan.",
-    }
-
-
-def tool_plan_guard_status(args: dict[str, Any]) -> dict[str, Any]:
-    tail = _as_int(args.get("tail"), 20, minimum=1, maximum=200)
-
-    store = _load_plan_store_for_guard()
-    normalized_store = _normalize_plan_store(store)
-
-    plans_raw = normalized_store.get("plans")
-    plans = plans_raw if isinstance(plans_raw, dict) else {}
-    order_raw = normalized_store.get("plan_order")
-    order = order_raw if isinstance(order_raw, list) else []
-
-    non_archived_count = 0
-    for plan_id in order:
-        plan = plans.get(plan_id)
-        if isinstance(plan, dict) and not bool(plan.get("archived", False)):
-            non_archived_count += 1
-
-    state = _load_control_state()
-    guard = _ensure_guard_policy_state(state)
-    latest_plan_id, changed = _resolve_guard_plan_id(state, normalized_store)
-    if changed:
-        _save_control_state(state)
-
-    confirmed_plan_id = _compact_text(guard.get("continue_confirmed_plan_id"), "") or None
-    confirmed_at = _compact_text(guard.get("continue_confirmed_at"), "") or None
-    confirmation_text = _compact_text(guard.get("continue_confirmation_text"), "")
-
-    audit_raw = guard.get("audit")
-    audit_entries = audit_raw if isinstance(audit_raw, list) else []
-    audit_tail = audit_entries[-tail:]
-
-    return {
-        "enforce_plan_for_writes": bool(guard.get("enforce_plan_for_writes", True)),
-        "enforce_proc_run_policy": bool(guard.get("enforce_proc_run_policy", True)),
-        "plan_count": len(order),
-        "non_archived_plan_count": non_archived_count,
-        "latest_plan_id": latest_plan_id,
-        "continue_confirmed_plan_id": confirmed_plan_id,
-        "continue_confirmed_at": confirmed_at,
-        "continue_confirmation_text": confirmation_text,
-        "continue_pending": bool(latest_plan_id and confirmed_plan_id != latest_plan_id),
-        "audit_count": len(audit_entries),
-        "audit_tail": audit_tail,
-    }
-
-
-
-def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
-    path = _path(_require_str(args, "path"))
-    encoding = str(args.get("encoding", "utf-8"))
-    content = path.read_text(encoding=encoding, errors="replace")
-
-    start_line = args.get("start_line")
-    end_line = args.get("end_line")
-    max_lines = args.get("max_lines")
-    max_chars = args.get("max_chars")
-
+def _apply_text_read_limits(
+    content: str,
+    start_line: Any,
+    end_line: Any,
+    max_lines: Any,
+    max_chars: Any,
+) -> dict[str, Any]:
     all_lines = content.splitlines(keepends=True)
     lines = all_lines
     if start_line is not None or end_line is not None:
@@ -1844,27 +789,783 @@ def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
             lines = lines[:line_limit]
             truncated_by_lines = True
 
-    content = "".join(lines)
+    limited_content = "".join(lines)
 
     truncated_by_chars = False
     if max_chars is not None:
         limit = _as_int(max_chars, 0, minimum=0)
-        if limit and len(content) > limit:
-            content = content[:limit]
+        if limit and len(limited_content) > limit:
+            limited_content = limited_content[:limit]
             truncated_by_chars = True
 
     return {
-        "path": str(path),
-        "encoding": encoding,
         "line_count": len(all_lines),
         "selected_line_count": selected_line_count,
         "returned_line_count": len(lines),
         "truncated": truncated_by_lines or truncated_by_chars,
         "truncated_by_lines": truncated_by_lines,
         "truncated_by_chars": truncated_by_chars,
-        "content": content,
+        "content": limited_content,
     }
 
+
+def _is_probably_text_jar_entry(entry_name: str) -> bool:
+    lower_name = entry_name.lower()
+    return lower_name.endswith(_JAR_TEXT_FILE_SUFFIXES)
+
+
+def _encode_binary_payload(data: bytes, binary_encoding: str) -> str:
+    if binary_encoding == "hex":
+        return data.hex()
+    return base64.b64encode(data).decode("ascii")
+
+
+_CLASS_METHOD_ACCESS_FLAGS: tuple[tuple[int, str], ...] = (
+    (0x0001, "public"),
+    (0x0002, "private"),
+    (0x0004, "protected"),
+    (0x0008, "static"),
+    (0x0010, "final"),
+    (0x0020, "synchronized"),
+    (0x0040, "bridge"),
+    (0x0080, "varargs"),
+    (0x0100, "native"),
+    (0x0400, "abstract"),
+    (0x0800, "strict"),
+    (0x1000, "synthetic"),
+)
+
+_CLASS_PRIMITIVE_TYPES: dict[str, str] = {
+    "V": "void",
+    "Z": "boolean",
+    "B": "byte",
+    "C": "char",
+    "S": "short",
+    "I": "int",
+    "J": "long",
+    "F": "float",
+    "D": "double",
+}
+
+
+def _class_read_u1(data: bytes, offset: int) -> tuple[int, int]:
+    if offset + 1 > len(data):
+        raise ValueError("invalid class format: unexpected EOF for u1")
+    return data[offset], offset + 1
+
+
+def _class_read_u2(data: bytes, offset: int) -> tuple[int, int]:
+    if offset + 2 > len(data):
+        raise ValueError("invalid class format: unexpected EOF for u2")
+    return int.from_bytes(data[offset : offset + 2], "big"), offset + 2
+
+
+def _class_read_u4(data: bytes, offset: int) -> tuple[int, int]:
+    if offset + 4 > len(data):
+        raise ValueError("invalid class format: unexpected EOF for u4")
+    return int.from_bytes(data[offset : offset + 4], "big"), offset + 4
+
+
+def _class_cp_utf8(cp: list[Any], index: int) -> Optional[str]:
+    if index <= 0 or index >= len(cp):
+        return None
+    item = cp[index]
+    if not isinstance(item, tuple) or len(item) < 2 or item[0] != "Utf8":
+        return None
+    value = item[1]
+    return value if isinstance(value, str) else None
+
+
+def _class_cp_class_name(cp: list[Any], index: int) -> Optional[str]:
+    if index <= 0 or index >= len(cp):
+        return None
+    item = cp[index]
+    if not isinstance(item, tuple) or len(item) < 2 or item[0] != "Class":
+        return None
+    name_index = item[1]
+    if not isinstance(name_index, int):
+        return None
+    class_name = _class_cp_utf8(cp, name_index)
+    if not class_name:
+        return None
+    return class_name.replace("/", ".")
+
+
+def _parse_jvm_type_descriptor(descriptor: str, index: int) -> tuple[str, int]:
+    array_dims = 0
+    while index < len(descriptor) and descriptor[index] == "[":
+        array_dims += 1
+        index += 1
+
+    if index >= len(descriptor):
+        raise ValueError("invalid descriptor: unexpected end")
+
+    tag = descriptor[index]
+    if tag in _CLASS_PRIMITIVE_TYPES:
+        result = _CLASS_PRIMITIVE_TYPES[tag]
+        index += 1
+    elif tag == "L":
+        end_index = descriptor.find(";", index)
+        if end_index < 0:
+            raise ValueError(f"invalid descriptor: missing ';' in `{descriptor}`")
+        result = descriptor[index + 1 : end_index].replace("/", ".")
+        index = end_index + 1
+    else:
+        raise ValueError(f"invalid descriptor tag `{tag}` in `{descriptor}`")
+
+    if array_dims > 0:
+        result += "[]" * array_dims
+    return result, index
+
+
+def _parse_jvm_method_descriptor(descriptor: str) -> tuple[list[str], str]:
+    if not descriptor.startswith("("):
+        raise ValueError(f"invalid method descriptor: `{descriptor}`")
+
+    index = 1
+    params: list[str] = []
+    while index < len(descriptor) and descriptor[index] != ")":
+        parsed_type, index = _parse_jvm_type_descriptor(descriptor, index)
+        params.append(parsed_type)
+
+    if index >= len(descriptor) or descriptor[index] != ")":
+        raise ValueError(f"invalid method descriptor: missing `)` in `{descriptor}`")
+
+    return_type, index = _parse_jvm_type_descriptor(descriptor, index + 1)
+    if index != len(descriptor):
+        raise ValueError(f"invalid method descriptor tail in `{descriptor}`")
+    return params, return_type
+
+
+def _class_method_access_list(flags: int) -> list[str]:
+    return [name for bit, name in _CLASS_METHOD_ACCESS_FLAGS if flags & bit]
+
+
+def _class_method_signature(method: dict[str, Any]) -> str:
+    access_text = " ".join(method.get("access", []))
+    params_text = ", ".join(method.get("params", []))
+    base = f"{method.get('name', '<unknown>')}({params_text}): {method.get('return', 'unknown')}"
+    return f"{access_text} {base}".strip()
+
+
+def _parse_class_methods(entry_bytes: bytes) -> dict[str, Any]:
+    offset = 0
+    magic, offset = _class_read_u4(entry_bytes, offset)
+    if magic != 0xCAFEBABE:
+        raise ValueError("invalid class format: bad magic header")
+
+    minor_version, offset = _class_read_u2(entry_bytes, offset)
+    major_version, offset = _class_read_u2(entry_bytes, offset)
+    cp_count, offset = _class_read_u2(entry_bytes, offset)
+
+    cp: list[Any] = [None] * cp_count
+    cp_index = 1
+    while cp_index < cp_count:
+        tag, offset = _class_read_u1(entry_bytes, offset)
+        if tag == 1:
+            text_len, offset = _class_read_u2(entry_bytes, offset)
+            if offset + text_len > len(entry_bytes):
+                raise ValueError("invalid class format: utf8 entry exceeds file size")
+            text = entry_bytes[offset : offset + text_len].decode("utf-8", errors="replace")
+            offset += text_len
+            cp[cp_index] = ("Utf8", text)
+        elif tag == 7:
+            name_index, offset = _class_read_u2(entry_bytes, offset)
+            cp[cp_index] = ("Class", name_index)
+        elif tag in {8, 16, 19, 20}:
+            ref_index, offset = _class_read_u2(entry_bytes, offset)
+            cp[cp_index] = ("Ref1", ref_index)
+        elif tag in {3, 4}:
+            _, offset = _class_read_u4(entry_bytes, offset)
+            cp[cp_index] = ("Num", None)
+        elif tag in {5, 6}:
+            _, offset = _class_read_u4(entry_bytes, offset)
+            _, offset = _class_read_u4(entry_bytes, offset)
+            cp[cp_index] = ("LongDouble", None)
+            cp_index += 1
+        elif tag in {9, 10, 11, 12, 17, 18}:
+            left, offset = _class_read_u2(entry_bytes, offset)
+            right, offset = _class_read_u2(entry_bytes, offset)
+            cp[cp_index] = ("Ref2", left, right)
+        elif tag == 15:
+            kind, offset = _class_read_u1(entry_bytes, offset)
+            ref_index, offset = _class_read_u2(entry_bytes, offset)
+            cp[cp_index] = ("MethodHandle", kind, ref_index)
+        else:
+            raise ValueError(f"unsupported class constant pool tag: {tag}")
+        cp_index += 1
+
+    _, offset = _class_read_u2(entry_bytes, offset)  # class access flags
+    this_class, offset = _class_read_u2(entry_bytes, offset)
+    super_class, offset = _class_read_u2(entry_bytes, offset)
+
+    interfaces_count, offset = _class_read_u2(entry_bytes, offset)
+    offset += interfaces_count * 2
+
+    fields_count, offset = _class_read_u2(entry_bytes, offset)
+    for _ in range(fields_count):
+        offset += 6
+        attr_count, offset = _class_read_u2(entry_bytes, offset)
+        for _ in range(attr_count):
+            offset += 2
+            attr_len, offset = _class_read_u4(entry_bytes, offset)
+            offset += attr_len
+
+    methods_count, offset = _class_read_u2(entry_bytes, offset)
+    methods: list[dict[str, Any]] = []
+    for _ in range(methods_count):
+        method_access, offset = _class_read_u2(entry_bytes, offset)
+        method_name_index, offset = _class_read_u2(entry_bytes, offset)
+        method_desc_index, offset = _class_read_u2(entry_bytes, offset)
+        method_attr_count, offset = _class_read_u2(entry_bytes, offset)
+
+        method_name = _class_cp_utf8(cp, method_name_index) or f"<name#{method_name_index}>"
+        method_desc = _class_cp_utf8(cp, method_desc_index) or f"<desc#{method_desc_index}>"
+        params, return_type = _parse_jvm_method_descriptor(method_desc)
+
+        methods.append(
+            {
+                "name": method_name,
+                "descriptor": method_desc,
+                "params": params,
+                "return": return_type,
+                "access": _class_method_access_list(method_access),
+            }
+        )
+
+        for _ in range(method_attr_count):
+            offset += 2
+            attr_len, offset = _class_read_u4(entry_bytes, offset)
+            offset += attr_len
+
+    class_attr_count, offset = _class_read_u2(entry_bytes, offset)
+    for _ in range(class_attr_count):
+        offset += 2
+        attr_len, offset = _class_read_u4(entry_bytes, offset)
+        offset += attr_len
+
+    public_methods = [item for item in methods if "public" in item.get("access", [])]
+    return {
+        "class_name": _class_cp_class_name(cp, this_class),
+        "super_class_name": _class_cp_class_name(cp, super_class) if super_class > 0 else None,
+        "major_version": major_version,
+        "minor_version": minor_version,
+        "methods": methods,
+        "public_methods": public_methods,
+    }
+
+_CFR_DEFAULT_VERSION = "0.152"
+_CFR_DEFAULT_FILENAME = f"cfr-{_CFR_DEFAULT_VERSION}.jar"
+_CFR_DEFAULT_URL = f"https://repo1.maven.org/maven2/org/benf/cfr/{_CFR_DEFAULT_VERSION}/{_CFR_DEFAULT_FILENAME}"
+
+
+def _candidate_source_entries_for_class(class_entry: str) -> list[str]:
+    normalized = class_entry.replace("\\", "/")
+    if not normalized.lower().endswith(".class"):
+        return []
+
+    class_path = normalized[:-6]
+    outer_class_path = class_path.split("$", 1)[0]
+    roots = [class_path]
+    if outer_class_path not in roots:
+        roots.append(outer_class_path)
+
+    result: list[str] = []
+    for root in roots:
+        for ext in (".java", ".kt", ".kts", ".scala", ".groovy"):
+            result.append(f"{root}{ext}")
+    return result
+
+
+def _try_read_text_from_zip_entry(zip_path: Path, entry_candidates: list[str], encoding: str) -> tuple[Optional[str], Optional[str]]:
+    if not entry_candidates:
+        return None, None
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            names = set(archive.namelist())
+            for candidate in entry_candidates:
+                if candidate in names:
+                    return archive.read(candidate).decode(encoding, errors="replace"), candidate
+    except Exception:
+        return None, None
+
+    return None, None
+
+
+def _source_jar_candidates_for(jar_path: Path) -> list[Path]:
+    direct = jar_path.with_name(f"{jar_path.stem}-sources.jar")
+    discovered = [child for child in jar_path.parent.glob("*sources*.jar") if child.is_file()]
+
+    all_candidates: list[Path] = []
+    if direct.exists():
+        all_candidates.append(direct)
+
+    base_stem = jar_path.stem.lower()
+    discovered.sort(
+        key=lambda item: (
+            -len(os.path.commonprefix([base_stem, item.stem.lower().replace("-sources", "")])),
+            abs(len(item.stem) - len(jar_path.stem)),
+            item.name.lower(),
+        )
+    )
+    for item in discovered:
+        if item not in all_candidates:
+            all_candidates.append(item)
+
+    return all_candidates
+
+
+def _find_source_for_class_entry(jar_path: Path, class_entry: str, encoding: str) -> tuple[Optional[str], dict[str, Any]]:
+    entry_candidates = _candidate_source_entries_for_class(class_entry)
+
+    source_text, source_entry = _try_read_text_from_zip_entry(jar_path, entry_candidates, encoding)
+    if source_text is not None and source_entry is not None:
+        return source_text, {
+            "source_origin": "jar_embedded_source",
+            "source_entry": source_entry,
+            "source_jar": str(jar_path),
+        }
+
+    for source_jar in _source_jar_candidates_for(jar_path):
+        source_text, source_entry = _try_read_text_from_zip_entry(source_jar, entry_candidates, encoding)
+        if source_text is not None and source_entry is not None:
+            return source_text, {
+                "source_origin": "sibling_sources_jar",
+                "source_entry": source_entry,
+                "source_jar": str(source_jar),
+            }
+
+    return None, {}
+
+
+def _find_source_for_class_file(class_path: Path, encoding: str) -> tuple[Optional[str], dict[str, Any]]:
+    stem = class_path.stem.split("$", 1)[0]
+    for ext in (".java", ".kt", ".kts", ".scala", ".groovy"):
+        candidate = class_path.with_name(f"{stem}{ext}")
+        if candidate.exists() and candidate.is_file():
+            return candidate.read_text(encoding=encoding, errors="replace"), {
+                "source_origin": "filesystem_source",
+                "source_path": str(candidate),
+            }
+    return None, {}
+
+
+def _resolve_java_tool(tool_name: str, explicit_path: Optional[str]) -> Optional[str]:
+    exe_name = f"{tool_name}.exe" if os.name == "nt" else tool_name
+
+    if explicit_path:
+        candidate = _path(explicit_path)
+        if candidate.exists() and candidate.is_file():
+            if candidate.stem.lower() == tool_name.lower():
+                return str(candidate)
+
+            sibling = candidate.with_name(exe_name)
+            if sibling.exists() and sibling.is_file():
+                return str(sibling)
+
+            if tool_name == "java":
+                return str(candidate)
+
+    found = shutil.which(tool_name)
+    if found:
+        return found
+
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if java_home:
+        candidate = Path(java_home) / "bin" / exe_name
+        if candidate.exists() and candidate.is_file():
+            return str(candidate.resolve())
+
+    return None
+
+
+def _resolve_decompiler_jar(decompiler_jar_arg: Optional[str]) -> Optional[Path]:
+    if decompiler_jar_arg:
+        explicit = _path(decompiler_jar_arg)
+        if explicit.exists() and explicit.is_file():
+            return explicit
+
+    env_value = os.environ.get("CODEXTOOLS_JAVA_DECOMPILER_JAR", "").strip()
+    if env_value:
+        env_path = _path(env_value)
+        if env_path.exists() and env_path.is_file():
+            return env_path
+
+    workspace_root = _resolve_runtime_workspace_root()
+    candidates = [
+        workspace_root / ".agent" / "cache" / _CFR_DEFAULT_FILENAME,
+        workspace_root / ".agent" / "tools" / _CFR_DEFAULT_FILENAME,
+        workspace_root / "tools" / _CFR_DEFAULT_FILENAME,
+        PROJECT_ROOT / ".agent" / "cache" / _CFR_DEFAULT_FILENAME,
+        PROJECT_ROOT / ".agent" / "tools" / _CFR_DEFAULT_FILENAME,
+        PROJECT_ROOT / "tools" / _CFR_DEFAULT_FILENAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    return None
+
+
+def _ensure_cfr_jar(java_bin: Optional[str], decompiler_jar_arg: Optional[str]) -> Optional[Path]:
+    existing = _resolve_decompiler_jar(decompiler_jar_arg)
+    if existing is not None:
+        return existing
+
+    if not java_bin:
+        return None
+
+    target = _resolve_runtime_workspace_root() / ".agent" / "cache" / _CFR_DEFAULT_FILENAME
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            with urllib.request.urlopen(_CFR_DEFAULT_URL, timeout=12) as response:
+                payload = response.read()
+            if not payload:
+                raise ValueError("downloaded empty cfr payload")
+            target.write_bytes(payload)
+        return target
+    except Exception:
+        return None
+
+
+def _run_process_capture(command: list[str], timeout_sec: int = 20) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_sec,
+        shell=False,
+    )
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _decompile_class_content(
+    *,
+    class_bytes: bytes,
+    class_entry: str,
+    jar_path: Optional[Path],
+    class_name: Optional[str],
+    java_bin_arg: Optional[str],
+    decompiler_jar_arg: Optional[str],
+) -> tuple[str, dict[str, Any]]:
+    java_bin = _resolve_java_tool("java", java_bin_arg)
+    javap_bin = _resolve_java_tool("javap", java_bin_arg)
+
+    decompiler_jar = _ensure_cfr_jar(java_bin, decompiler_jar_arg)
+    if java_bin and decompiler_jar is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="codextools-cfr-") as temp_dir:
+                temp_root = Path(temp_dir)
+                class_file = temp_root / class_entry
+                class_file.parent.mkdir(parents=True, exist_ok=True)
+                class_file.write_bytes(class_bytes)
+                returncode, stdout, stderr = _run_process_capture(
+                    [
+                        java_bin,
+                        "-jar",
+                        str(decompiler_jar),
+                        str(class_file),
+                        "--silent",
+                        "true",
+                    ]
+                )
+                if stdout.strip():
+                    return stdout, {
+                        "source_origin": "java_decompiler_cfr",
+                        "decompiler_used": "cfr",
+                        "decompiler_returncode": returncode,
+                        "decompiler_stderr": stderr,
+                    }
+        except Exception:
+            pass
+
+    if javap_bin:
+        try:
+            if jar_path is not None and class_name:
+                returncode, stdout, stderr = _run_process_capture(
+                    [javap_bin, "-classpath", str(jar_path), "-p", "-c", class_name]
+                )
+            else:
+                with tempfile.TemporaryDirectory(prefix="codextools-javap-") as temp_dir:
+                    temp_file = Path(temp_dir) / Path(class_entry).name
+                    temp_file.write_bytes(class_bytes)
+                    returncode, stdout, stderr = _run_process_capture(
+                        [javap_bin, "-p", "-c", str(temp_file)]
+                    )
+            if stdout.strip():
+                return stdout, {
+                    "source_origin": "java_disassembly_javap",
+                    "decompiler_used": "javap",
+                    "decompiler_returncode": returncode,
+                    "decompiler_stderr": stderr,
+                }
+        except Exception:
+            pass
+
+    class_info = _parse_class_methods(class_bytes)
+    signatures = [_class_method_signature(item) for item in class_info.get("methods", [])]
+    return "\n".join(signatures), {
+        "source_origin": "methods_fallback",
+        "decompiler_used": None,
+        "decompile_error": "no Java decompiler available; fallback to parsed method signatures",
+    }
+
+def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
+    raw_path = _require_str(args, "path")
+    encoding = str(args.get("encoding", "utf-8"))
+
+    binary_encoding = str(args.get("binary_encoding", "base64")).strip().lower()
+    if binary_encoding not in {"base64", "hex"}:
+        raise ValueError("`binary_encoding` must be one of: base64, hex")
+
+    class_mode = str(args.get("class_mode", "bytecode")).strip().lower()
+    if class_mode not in {"bytecode", "methods", "source"}:
+        raise ValueError("`class_mode` must be one of: bytecode, methods, source")
+
+    java_bin_arg_raw = args.get("java_bin")
+    java_bin_arg: Optional[str] = None
+    if java_bin_arg_raw is not None:
+        if not isinstance(java_bin_arg_raw, str) or not java_bin_arg_raw.strip():
+            raise ValueError("`java_bin` must be a non-empty string when provided")
+        java_bin_arg = java_bin_arg_raw.strip()
+
+    decompiler_jar_arg_raw = args.get("decompiler_jar")
+    decompiler_jar_arg: Optional[str] = None
+    if decompiler_jar_arg_raw is not None:
+        if not isinstance(decompiler_jar_arg_raw, str) or not decompiler_jar_arg_raw.strip():
+            raise ValueError("`decompiler_jar` must be a non-empty string when provided")
+        decompiler_jar_arg = decompiler_jar_arg_raw.strip()
+
+    jar_entry_arg = args.get("jar_entry")
+    jar_entry: Optional[str] = None
+    if jar_entry_arg is not None:
+        if not isinstance(jar_entry_arg, str) or not jar_entry_arg.strip():
+            raise ValueError("`jar_entry` must be a non-empty string when provided")
+        jar_entry = _normalize_jar_entry_name(jar_entry_arg)
+
+    start_line = args.get("start_line")
+    end_line = args.get("end_line")
+    max_lines = args.get("max_lines")
+    max_chars = args.get("max_chars")
+
+    path, inline_jar_entry = _split_jar_path_and_entry(raw_path)
+    if inline_jar_entry is not None and jar_entry is not None:
+        raise ValueError("Use either `path` jar `!/entry` syntax or `jar_entry`, not both")
+
+    def _append_class_info(result: dict[str, Any], class_info: Optional[dict[str, Any]]) -> None:
+        if not isinstance(class_info, dict):
+            return
+        result.update(
+            {
+                "class_name": class_info.get("class_name"),
+                "super_class_name": class_info.get("super_class_name"),
+                "class_major_version": class_info.get("major_version"),
+                "class_minor_version": class_info.get("minor_version"),
+                "declared_method_count": len(class_info.get("methods", [])),
+                "public_method_count": len(class_info.get("public_methods", [])),
+            }
+        )
+
+    def _build_class_result(
+        *,
+        class_bytes: bytes,
+        class_entry: str,
+        source_lookup: Callable[[], tuple[Optional[str], dict[str, Any]]],
+        jar_owner: Optional[Path],
+    ) -> dict[str, Any]:
+        class_info: Optional[dict[str, Any]] = None
+        try:
+            class_info = _parse_class_methods(class_bytes)
+        except Exception:
+            class_info = None
+
+        if class_mode == "methods":
+            if class_info is None:
+                class_info = _parse_class_methods(class_bytes)
+            method_lines = [_class_method_signature(item) for item in class_info["methods"]]
+            content = "\n".join(method_lines)
+            content_kind = "class_methods"
+            content_encoding = encoding
+            extra_meta: dict[str, Any] = {"source_origin": "class_method_parser"}
+        elif class_mode == "source":
+            source_text, source_meta = source_lookup()
+            if source_text is None:
+                class_name = class_info.get("class_name") if isinstance(class_info, dict) else None
+                source_text, source_meta = _decompile_class_content(
+                    class_bytes=class_bytes,
+                    class_entry=class_entry,
+                    jar_path=jar_owner,
+                    class_name=class_name,
+                    java_bin_arg=java_bin_arg,
+                    decompiler_jar_arg=decompiler_jar_arg,
+                )
+            content = source_text
+            content_encoding = encoding
+            source_origin = str(source_meta.get("source_origin", "")).strip().lower()
+            if source_origin in {"jar_embedded_source", "sibling_sources_jar", "filesystem_source"}:
+                content_kind = "class_source"
+            elif source_origin == "java_disassembly_javap":
+                content_kind = "class_disassembly"
+            elif source_origin == "methods_fallback":
+                content_kind = "class_methods"
+            else:
+                content_kind = "class_decompiled"
+            extra_meta = source_meta
+        else:
+            content = _encode_binary_payload(class_bytes, binary_encoding)
+            content_kind = "class_bytecode"
+            content_encoding = binary_encoding
+            extra_meta = {}
+
+        limited = _apply_text_read_limits(content, start_line, end_line, max_lines, max_chars)
+        result = {
+            "encoding": encoding,
+            "line_count": limited["line_count"],
+            "selected_line_count": limited["selected_line_count"],
+            "returned_line_count": limited["returned_line_count"],
+            "truncated": limited["truncated"],
+            "truncated_by_lines": limited["truncated_by_lines"],
+            "truncated_by_chars": limited["truncated_by_chars"],
+            "content": limited["content"],
+            "content_kind": content_kind,
+            "content_encoding": content_encoding,
+            "raw_size_bytes": len(class_bytes),
+        }
+        result.update(extra_meta)
+        _append_class_info(result, class_info)
+        return result
+
+    if path.suffix.lower() != ".jar":
+        if jar_entry is not None:
+            raise ValueError("`jar_entry` requires `path` to end with `.jar`")
+
+        if path.suffix.lower() == ".class":
+            class_bytes = path.read_bytes()
+            class_result = _build_class_result(
+                class_bytes=class_bytes,
+                class_entry=path.name,
+                source_lookup=lambda: _find_source_for_class_file(path, encoding),
+                jar_owner=None,
+            )
+            class_result["path"] = str(path)
+            return class_result
+
+        if class_mode != "bytecode":
+            raise ValueError("`class_mode` requires target file/entry to be `.class`")
+
+        content = path.read_text(encoding=encoding, errors="replace")
+        limited = _apply_text_read_limits(content, start_line, end_line, max_lines, max_chars)
+        return {
+            "path": str(path),
+            "encoding": encoding,
+            "line_count": limited["line_count"],
+            "selected_line_count": limited["selected_line_count"],
+            "returned_line_count": limited["returned_line_count"],
+            "truncated": limited["truncated"],
+            "truncated_by_lines": limited["truncated_by_lines"],
+            "truncated_by_chars": limited["truncated_by_chars"],
+            "content": limited["content"],
+        }
+
+    selected_entry = jar_entry or inline_jar_entry
+    with zipfile.ZipFile(path, "r") as jar_file:
+        if selected_entry is None:
+            if class_mode != "bytecode":
+                raise ValueError("`class_mode` requires a specific `.class` jar entry")
+            entry_names = jar_file.namelist()
+            content = "\n".join(entry_names)
+            limited = _apply_text_read_limits(content, start_line, end_line, max_lines, max_chars)
+            return {
+                "path": str(path),
+                "encoding": encoding,
+                "line_count": limited["line_count"],
+                "selected_line_count": limited["selected_line_count"],
+                "returned_line_count": limited["returned_line_count"],
+                "truncated": limited["truncated"],
+                "truncated_by_lines": limited["truncated_by_lines"],
+                "truncated_by_chars": limited["truncated_by_chars"],
+                "content": limited["content"],
+                "archive_type": "jar",
+                "archive_entry_count": len(entry_names),
+                "archive_entry": None,
+                "content_kind": "jar_entry_list",
+            }
+
+        selected_entry = _normalize_jar_entry_name(selected_entry)
+        if selected_entry.endswith("/"):
+            raise ValueError("`jar_entry` must reference a file, not a directory")
+
+        try:
+            entry_bytes = jar_file.read(selected_entry)
+        except KeyError as exc:
+            raise ValueError(f"jar entry not found: {selected_entry}") from exc
+
+    is_class_entry = selected_entry.lower().endswith(".class")
+    if is_class_entry:
+        class_result = _build_class_result(
+            class_bytes=entry_bytes,
+            class_entry=selected_entry,
+            source_lookup=lambda: _find_source_for_class_entry(path, selected_entry, encoding),
+            jar_owner=path,
+        )
+        class_result.update(
+            {
+                "path": f"{path}!/{selected_entry}",
+                "archive_type": "jar",
+                "archive_entry": selected_entry,
+                "archive_entry_count": None,
+            }
+        )
+        return class_result
+
+    if class_mode != "bytecode":
+        raise ValueError("`class_mode` requires target file/entry to be `.class`")
+
+    is_binary = False
+    entry_text = ""
+    if _is_probably_text_jar_entry(selected_entry):
+        entry_text = entry_bytes.decode(encoding, errors="replace")
+    else:
+        try:
+            decoded = entry_bytes.decode(encoding)
+            if "\x00" in decoded:
+                is_binary = True
+            else:
+                entry_text = decoded
+        except UnicodeDecodeError:
+            is_binary = True
+
+    if is_binary:
+        content = _encode_binary_payload(entry_bytes, binary_encoding)
+        content_kind = "binary"
+        content_encoding = binary_encoding
+    else:
+        content = entry_text
+        content_kind = "text"
+        content_encoding = encoding
+
+    limited = _apply_text_read_limits(content, start_line, end_line, max_lines, max_chars)
+    return {
+        "path": f"{path}!/{selected_entry}",
+        "encoding": encoding,
+        "line_count": limited["line_count"],
+        "selected_line_count": limited["selected_line_count"],
+        "returned_line_count": limited["returned_line_count"],
+        "truncated": limited["truncated"],
+        "truncated_by_lines": limited["truncated_by_lines"],
+        "truncated_by_chars": limited["truncated_by_chars"],
+        "content": limited["content"],
+        "archive_type": "jar",
+        "archive_entry": selected_entry,
+        "archive_entry_count": None,
+        "content_kind": content_kind,
+        "content_encoding": content_encoding,
+        "raw_size_bytes": len(entry_bytes),
+    }
 
 def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
     ranges_arg = args.get("ranges")
@@ -1872,6 +1573,35 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
 
     if ranges_arg is not None and paths_arg is not None:
         raise ValueError("Use either `paths` or `ranges`, not both")
+
+    jar_entry_default_arg = args.get("jar_entry")
+    jar_entry_default: Optional[str] = None
+    if jar_entry_default_arg is not None:
+        if not isinstance(jar_entry_default_arg, str) or not jar_entry_default_arg.strip():
+            raise ValueError("`jar_entry` must be a non-empty string when provided")
+        jar_entry_default = _normalize_jar_entry_name(jar_entry_default_arg)
+
+    binary_encoding_default = str(args.get("binary_encoding", "base64")).strip().lower()
+    if binary_encoding_default not in {"base64", "hex"}:
+        raise ValueError("`binary_encoding` must be one of: base64, hex")
+
+    class_mode_default = str(args.get("class_mode", "bytecode")).strip().lower()
+    if class_mode_default not in {"bytecode", "methods", "source"}:
+        raise ValueError("`class_mode` must be one of: bytecode, methods, source")
+
+    java_bin_default_arg = args.get("java_bin")
+    java_bin_default: Optional[str] = None
+    if java_bin_default_arg is not None:
+        if not isinstance(java_bin_default_arg, str) or not java_bin_default_arg.strip():
+            raise ValueError("`java_bin` must be a non-empty string when provided")
+        java_bin_default = java_bin_default_arg.strip()
+
+    decompiler_jar_default_arg = args.get("decompiler_jar")
+    decompiler_jar_default: Optional[str] = None
+    if decompiler_jar_default_arg is not None:
+        if not isinstance(decompiler_jar_default_arg, str) or not decompiler_jar_default_arg.strip():
+            raise ValueError("`decompiler_jar` must be a non-empty string when provided")
+        decompiler_jar_default = decompiler_jar_default_arg.strip()
 
     requests: list[dict[str, Any]] = []
     if ranges_arg is not None:
@@ -1893,6 +1623,31 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
                 request["max_lines"] = _as_int(item.get("max_lines"), 1, minimum=1)
             if "max_chars" in item and item.get("max_chars") is not None:
                 request["max_chars"] = _as_int(item.get("max_chars"), 0, minimum=0)
+            if "jar_entry" in item and item.get("jar_entry") is not None:
+                jar_entry_item = item.get("jar_entry")
+                if not isinstance(jar_entry_item, str) or not jar_entry_item.strip():
+                    raise ValueError(f"`ranges[{index}].jar_entry` must be a non-empty string")
+                request["jar_entry"] = _normalize_jar_entry_name(jar_entry_item)
+            if "binary_encoding" in item and item.get("binary_encoding") is not None:
+                binary_encoding_item = str(item.get("binary_encoding")).strip().lower()
+                if binary_encoding_item not in {"base64", "hex"}:
+                    raise ValueError(f"`ranges[{index}].binary_encoding` must be one of: base64, hex")
+                request["binary_encoding"] = binary_encoding_item
+            if "class_mode" in item and item.get("class_mode") is not None:
+                class_mode_item = str(item.get("class_mode")).strip().lower()
+                if class_mode_item not in {"bytecode", "methods", "source"}:
+                    raise ValueError(f"`ranges[{index}].class_mode` must be one of: bytecode, methods, source")
+                request["class_mode"] = class_mode_item
+            if "java_bin" in item and item.get("java_bin") is not None:
+                java_bin_item = item.get("java_bin")
+                if not isinstance(java_bin_item, str) or not java_bin_item.strip():
+                    raise ValueError(f"`ranges[{index}].java_bin` must be a non-empty string")
+                request["java_bin"] = java_bin_item.strip()
+            if "decompiler_jar" in item and item.get("decompiler_jar") is not None:
+                decompiler_jar_item = item.get("decompiler_jar")
+                if not isinstance(decompiler_jar_item, str) or not decompiler_jar_item.strip():
+                    raise ValueError(f"`ranges[{index}].decompiler_jar` must be a non-empty string")
+                request["decompiler_jar"] = decompiler_jar_item.strip()
             requests.append(request)
     else:
         paths = _require_str_list(args, "paths")
@@ -1924,7 +1679,29 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
         entry: dict[str, Any] = {"path": str(_path(raw_path))}
         try:
             if include_content:
-                read_args: dict[str, Any] = {"path": raw_path, "encoding": encoding}
+                selected_binary_encoding = request.get("binary_encoding", binary_encoding_default)
+                selected_class_mode = request.get("class_mode", class_mode_default)
+                selected_java_bin = request.get("java_bin", java_bin_default)
+                selected_decompiler_jar = request.get("decompiler_jar", decompiler_jar_default)
+                read_args: dict[str, Any] = {
+                    "path": raw_path,
+                    "encoding": encoding,
+                    "binary_encoding": selected_binary_encoding,
+                    "class_mode": selected_class_mode,
+                }
+                if selected_java_bin is not None:
+                    read_args["java_bin"] = selected_java_bin
+                    entry["java_bin"] = selected_java_bin
+                if selected_decompiler_jar is not None:
+                    read_args["decompiler_jar"] = selected_decompiler_jar
+                    entry["decompiler_jar"] = selected_decompiler_jar
+                entry["binary_encoding"] = selected_binary_encoding
+                entry["class_mode"] = selected_class_mode
+
+                selected_jar_entry = request.get("jar_entry", jar_entry_default)
+                if selected_jar_entry is not None:
+                    read_args["jar_entry"] = selected_jar_entry
+                    entry["jar_entry"] = selected_jar_entry
 
                 selected_start_line = request.get("start_line", start_line)
                 selected_end_line = request.get("end_line", end_line)
@@ -1960,6 +1737,7 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
                 read_result = tool_fs_read_text(read_args)
                 entry.update(
                     {
+                        "path": read_result.get("path", entry["path"]),
                         "exists": True,
                         "line_count": read_result["line_count"],
                         "selected_line_count": read_result["selected_line_count"],
@@ -1970,6 +1748,30 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
                         "content": read_result["content"],
                     }
                 )
+                for meta_key in (
+                    "archive_type",
+                    "archive_entry",
+                    "archive_entry_count",
+                    "content_kind",
+                    "content_encoding",
+                    "raw_size_bytes",
+                    "class_name",
+                    "super_class_name",
+                    "class_major_version",
+                    "class_minor_version",
+                    "declared_method_count",
+                    "public_method_count",
+                    "source_origin",
+                    "source_entry",
+                    "source_jar",
+                    "source_path",
+                    "decompiler_used",
+                    "decompiler_returncode",
+                    "decompiler_stderr",
+                    "decompile_error",
+                ):
+                    if meta_key in read_result:
+                        entry[meta_key] = read_result[meta_key]
                 total_returned_chars += len(read_result["content"])
                 if read_result["truncated"]:
                     total_truncated_files += 1
@@ -1997,7 +1799,6 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
         "results": results,
     }
 
-
 def tool_fs_write_text(args: dict[str, Any]) -> dict[str, Any]:
     path = _path(_require_str(args, "path"))
     content = args.get("content", "")
@@ -2016,7 +1817,6 @@ def tool_fs_write_text(args: dict[str, Any]) -> dict[str, Any]:
         written = f.write(content)
 
     return {"path": str(path), "mode": mode, "encoding": encoding, "written_chars": written}
-
 
 def tool_fs_replace_text(args: dict[str, Any]) -> dict[str, Any]:
     path = _path(_require_str(args, "path"))
@@ -2714,13 +2514,6 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Union[dict[str, Any], str]]]
     "fs_move_file": tool_fs_move_file,
     "fs_copy_file": tool_fs_copy_file,
     "fs_create": tool_fs_create,
-    "plan_create": tool_plan_create,
-    "plan_update": tool_plan_update,
-    "plan_view": tool_plan_view,
-    "plan_list": tool_plan_list,
-    "plan_archive": tool_plan_archive,
-    "plan_confirm_continue": tool_plan_confirm_continue,
-    "plan_guard_status": tool_plan_guard_status,
     "proc_run": tool_proc_run,
     "img_draw": tool_img_draw,
     "sound_beep": tool_sound_beep,
@@ -2728,8 +2521,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Union[dict[str, Any], str]]]
 
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
-    "fs_read_text": "Read a UTF-8 text file. Supports line range, max_lines and max_chars truncation.",
-    "fs_read_texts": "Read multiple UTF-8 text files in one call with per-file/total caps and optional per-range line windows.",
+    "fs_read_text": "Read a UTF-8 text file or a `.jar` entry. Supports line range, max_lines/max_chars truncation, `.class` bytecode/method parsing, and source-first Java decompile via `class_mode=source`.",
+    "fs_read_texts": "Read multiple UTF-8 files or `.jar` entries with per-file/total caps, optional per-range windows, and class read modes (`bytecode|methods|source`).",
     "fs_write_text": "Write or append UTF-8 text to a file. Creates parent dirs by default.",
     "fs_replace_text": "Find and replace text in a UTF-8 file.",
     "fs_replace_regex": "Find and replace text with a regular expression in a UTF-8 file.",
@@ -2743,13 +2536,6 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "fs_move_file": "Move a single file from source to destination.",
     "fs_copy_file": "Copy a single file from source to destination.",
     "fs_create": "Create a file or directory. Use kind=file|dir.",
-    "plan_create": "Create a plan group and persist it to root markdown file `<project>-plan.md`.",
-    "plan_update": "Update one plan step and sync markdown checklist state.",
-    "plan_view": "View one plan group from markdown checklist store.",
-    "plan_list": "List plan groups from markdown checklist store.",
-    "plan_archive": "Archive or unarchive one markdown plan group.",
-    "plan_confirm_continue": "Record explicit user continue confirmation for a plan before write tools are allowed.",
-    "plan_guard_status": "View plan-first/write guard state and recent policy audit events.",
     "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Requires `reason` and blocks shell/file-text operations that should use fs tools.",
     "img_draw": "Draw an image with primitive shapes (line, rect, ellipse, text, polygon). Requires Pillow.",
     "sound_beep": "Play a beep notification sound.",
@@ -2766,6 +2552,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "end_line": {"type": "integer", "minimum": 1},
             "max_lines": {"type": "integer", "minimum": 1},
             "max_chars": {"type": "integer", "minimum": 0},
+            "jar_entry": {"type": "string", "description": "Entry path inside .jar. Optional when using `path` syntax `archive.jar!/entry`."},
+            "binary_encoding": {"type": "string", "enum": ["base64", "hex"], "default": "base64", "description": "Encoding used when returning binary entry data such as .class."},
+            "class_mode": {"type": "string", "enum": ["bytecode", "methods", "source"], "default": "bytecode", "description": "How to read .class targets: raw bytecode encoding, parsed method signatures, or source-first lookup with Java decompile fallback."},
+            "java_bin": {"type": "string", "description": "Optional path to Java executable used for decompile/disassemble when class_mode=source."},
+            "decompiler_jar": {"type": "string", "description": "Optional path to decompiler jar (for example CFR). When omitted, server will try built-in discovery/download."},
         },
         "required": ["path"],
         "additionalProperties": False,
@@ -2783,7 +2574,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "start_line": {"type": "integer", "minimum": 1},
                         "end_line": {"type": "integer", "minimum": 1},
                         "max_lines": {"type": "integer", "minimum": 1},
-                        "max_chars": {"type": "integer", "minimum": 0}
+                        "max_chars": {"type": "integer", "minimum": 0},
+                        "jar_entry": {"type": "string", "description": "Entry path inside .jar for this range item."},
+                        "binary_encoding": {"type": "string", "enum": ["base64", "hex"], "description": "Encoding for binary jar entry data."},
+                        "class_mode": {"type": "string", "enum": ["bytecode", "methods", "source"], "description": "How to read .class target for this range item (source mode tries source first, then decompile)."},
+                        "java_bin": {"type": "string", "description": "Optional Java executable path for this range item when class_mode=source."},
+                        "decompiler_jar": {"type": "string", "description": "Optional decompiler jar path for this range item when class_mode=source."}
                     },
                     "required": ["path"],
                     "additionalProperties": False
@@ -2791,6 +2587,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "minItems": 1
             },
             "encoding": {"type": "string", "default": "utf-8"},
+            "jar_entry": {"type": "string", "description": "Default entry path inside .jar when reading jar files."},
+            "binary_encoding": {"type": "string", "enum": ["base64", "hex"], "default": "base64", "description": "Default encoding for binary jar entry data such as .class."},
+            "class_mode": {"type": "string", "enum": ["bytecode", "methods", "source"], "default": "bytecode", "description": "Default class read mode for .class targets, including source-first Java decompile."},
+            "java_bin": {"type": "string", "description": "Default Java executable path used by source mode when decompilation is needed."},
+            "decompiler_jar": {"type": "string", "description": "Default decompiler jar path used by source mode when decompilation is needed."},
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
             "max_lines_per_file": {"type": "integer", "minimum": 0, "default": 0},
@@ -2957,73 +2758,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "overwrite": {"type": "boolean", "default": False, "description": "Overwrite target file when kind=file"},
         },
         "required": ["path"],
-        "additionalProperties": False,
-    },
-    "plan_create": {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string", "default": ""},
-            "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-        },
-        "required": ["title", "steps"],
-        "additionalProperties": False,
-    },
-    "plan_update": {
-        "type": "object",
-        "properties": {
-            "plan_id": {"type": "string"},
-            "step_id": {"type": "string"},
-            "step_index": {"type": "integer", "minimum": 1},
-            "status": {
-                "type": "string",
-                "enum": ["pending", "in_progress", "completed", "blocked", "canceled"],
-            },
-            "note": {"type": "string"},
-            "exclusive_in_progress": {"type": "boolean", "default": True},
-        },
-        "required": ["plan_id", "status"],
-        "anyOf": [{"required": ["step_id"]}, {"required": ["step_index"]}],
-        "additionalProperties": False,
-    },
-    "plan_view": {
-        "type": "object",
-        "properties": {
-            "plan_id": {"type": "string"},
-        },
-        "required": ["plan_id"],
-        "additionalProperties": False,
-    },
-    "plan_list": {
-        "type": "object",
-        "properties": {
-            "include_archived": {"type": "boolean", "default": False},
-        },
-        "additionalProperties": False,
-    },
-    "plan_archive": {
-        "type": "object",
-        "properties": {
-            "plan_id": {"type": "string"},
-            "archived": {"type": "boolean", "default": True},
-        },
-        "required": ["plan_id"],
-        "additionalProperties": False,
-    },
-    "plan_confirm_continue": {
-        "type": "object",
-        "properties": {
-            "confirmation": {"type": "string"},
-            "plan_id": {"type": "string"},
-        },
-        "required": ["confirmation"],
-        "additionalProperties": False,
-    },
-    "plan_guard_status": {
-        "type": "object",
-        "properties": {
-            "tail": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
-        },
         "additionalProperties": False,
     },
     "proc_run": {

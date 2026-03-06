@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Union
 
 from .extensions.browser_tools import get_browser_tooling
+from .extensions.computer_use_tools import get_computer_use_tooling
 from .extensions.debug_tools import get_debug_tooling
 from .extensions.perf_tools import get_perf_tooling
 from .extensions.ui_tools import get_ui_tooling
@@ -42,6 +43,7 @@ def get_extension_tooling() -> tuple[
         get_perf_tooling,
         get_ui_tooling,
         get_browser_tooling,
+        get_computer_use_tooling,
     ):
         p_handlers, p_descriptions, p_schemas = provider()
         _merge_tooling(handlers, descriptions, schemas, p_handlers, p_descriptions, p_schemas)
