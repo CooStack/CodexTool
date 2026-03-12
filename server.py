@@ -172,8 +172,13 @@ PROC_RUN_DENY_PRIMARY_COMMANDS = {
 }
 PROC_RUN_REDIRECTION_PATTERN = re.compile(r"(?:^|\s)(?:\|>|>>|<|<<|1>|2>|1>>|2>>)(?:\s|$)")
 MODEL_LINE_PATTERN = re.compile(r"(?m)^\s*model\s*=\s*[\"']([^\"']+)[\"']\s*$")
-AUTO_AGENT_BLOCK_START = "<!-- codextools:auto-agent-rules:v1:start -->"
-AUTO_AGENT_BLOCK_END = "<!-- codextools:auto-agent-rules:v1:end -->"
+AUTO_AGENT_RULES_VERSION = 2
+AUTO_AGENT_BLOCK_NAMESPACE = "codextools:auto-agent-rules"
+AUTO_AGENT_BLOCK_START = f"<!-- {AUTO_AGENT_BLOCK_NAMESPACE}:v{AUTO_AGENT_RULES_VERSION}:start -->"
+AUTO_AGENT_BLOCK_END = f"<!-- {AUTO_AGENT_BLOCK_NAMESPACE}:v{AUTO_AGENT_RULES_VERSION}:end -->"
+AUTO_AGENT_BLOCK_PATTERN = re.compile(
+    rf"(?s)(?P<block><!--\s*{re.escape(AUTO_AGENT_BLOCK_NAMESPACE)}(?:\:v(?P<start_version>\d+))?\:start\s*-->.*?<!--\s*{re.escape(AUTO_AGENT_BLOCK_NAMESPACE)}(?:\:v(?P<end_version>\d+))?\:end\s*-->)"
+)
 FALLBACK_AGENT_RULES_TEXT = "# Agent Rules\n\n- Follow project instructions for this workspace.\n"
 _RUNTIME_MODEL_HINT = ""
 _RUNTIME_WORKSPACE_ROOT_HINT = ""
@@ -343,6 +348,38 @@ def _compact_text(value: Any, fallback: str = "") -> str:
 
 def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _strip_auto_agent_blocks(text: str) -> str:
+    normalized = _normalize_newlines(text)
+    stripped = AUTO_AGENT_BLOCK_PATTERN.sub("", normalized)
+    return re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+
+def _get_auto_agent_block_match(text: str) -> Optional[re.Match[str]]:
+    return AUTO_AGENT_BLOCK_PATTERN.search(_normalize_newlines(text))
+
+
+def _get_auto_agent_block_version(match: re.Match[str]) -> Optional[int]:
+    versions: list[int] = []
+    for group_name in ("start_version", "end_version"):
+        raw_value = match.group(group_name)
+        if raw_value is None:
+            continue
+        try:
+            versions.append(int(raw_value))
+        except ValueError:
+            return None
+    if not versions:
+        return None
+    return min(versions)
+
+
+def _build_auto_agent_block(template_text: str) -> str:
+    normalized_template = _strip_auto_agent_blocks(template_text)
+    if not normalized_template:
+        normalized_template = _strip_auto_agent_blocks(FALLBACK_AGENT_RULES_TEXT)
+    return f"{AUTO_AGENT_BLOCK_START}\n{normalized_template}\n{AUTO_AGENT_BLOCK_END}\n"
 
 
 def _path_from_workspace_uri(uri_text: str) -> Optional[Path]:
@@ -537,7 +574,7 @@ def _load_agent_template_text(target_filename: str, workspace_root: Path) -> str
         except Exception:
             continue
 
-        normalized = _normalize_newlines(text).strip()
+        normalized = _strip_auto_agent_blocks(text)
         if normalized:
             return normalized + "\n"
 
@@ -550,9 +587,10 @@ def _ensure_runtime_agent_file_ready() -> dict[str, Any]:
     target_path = workspace_root / target_filename
 
     template_text = _load_agent_template_text(target_filename, workspace_root)
-    normalized_template = _normalize_newlines(template_text).strip()
+    normalized_template = _strip_auto_agent_blocks(template_text)
     if not normalized_template:
-        normalized_template = _normalize_newlines(FALLBACK_AGENT_RULES_TEXT).strip()
+        normalized_template = _strip_auto_agent_blocks(FALLBACK_AGENT_RULES_TEXT)
+    managed_block = _build_auto_agent_block(normalized_template)
 
     workspace_root.mkdir(parents=True, exist_ok=True)
 
@@ -562,49 +600,97 @@ def _ensure_runtime_agent_file_ready() -> dict[str, Any]:
         existing_text = target_path.read_text(encoding="utf-8", errors="replace")
 
     normalized_existing = _normalize_newlines(existing_text)
+    stripped_existing = normalized_existing.strip()
+    block_match = _get_auto_agent_block_match(normalized_existing)
+    if block_match is not None:
+        block_version = _get_auto_agent_block_version(block_match)
+        existing_block = _normalize_newlines(block_match.group("block")).strip()
+        desired_block = managed_block.strip()
+        if block_version is not None and block_version > AUTO_AGENT_RULES_VERSION:
+            return {
+                "path": str(target_path),
+                "filename": target_filename,
+                "workspace_root": str(workspace_root),
+                "action": "already_newer",
+                "current_version": AUTO_AGENT_RULES_VERSION,
+                "existing_version": block_version,
+            }
+        if block_version == AUTO_AGENT_RULES_VERSION and existing_block == desired_block:
+            return {
+                "path": str(target_path),
+                "filename": target_filename,
+                "workspace_root": str(workspace_root),
+                "action": "already_current",
+                "current_version": AUTO_AGENT_RULES_VERSION,
+                "existing_version": block_version,
+            }
+
+        updated_text = (
+            normalized_existing[: block_match.start("block")]
+            + managed_block
+            + normalized_existing[block_match.end("block") :]
+        )
+        if updated_text and not updated_text.endswith("\n"):
+            updated_text += "\n"
+        target_path.write_text(updated_text, encoding="utf-8", newline="")
+        update_reason = "version_missing"
+        if block_version is not None:
+            update_reason = "version_outdated" if block_version < AUTO_AGENT_RULES_VERSION else "content_changed"
+        return {
+            "path": str(target_path),
+            "filename": target_filename,
+            "workspace_root": str(workspace_root),
+            "action": "updated",
+            "current_version": AUTO_AGENT_RULES_VERSION,
+            "existing_version": block_version,
+            "update_reason": update_reason,
+        }
+
+    if stripped_existing == normalized_template:
+        target_path.write_text(managed_block, encoding="utf-8", newline="")
+        return {
+            "path": str(target_path),
+            "filename": target_filename,
+            "workspace_root": str(workspace_root),
+            "action": "versioned",
+            "current_version": AUTO_AGENT_RULES_VERSION,
+            "existing_version": None,
+        }
+
     if normalized_template and normalized_template in normalized_existing:
         return {
             "path": str(target_path),
             "filename": target_filename,
             "workspace_root": str(workspace_root),
             "action": "already_present",
+            "current_version": AUTO_AGENT_RULES_VERSION,
         }
 
-    if AUTO_AGENT_BLOCK_START in normalized_existing and AUTO_AGENT_BLOCK_END in normalized_existing:
-        return {
-            "path": str(target_path),
-            "filename": target_filename,
-            "workspace_root": str(workspace_root),
-            "action": "already_appended",
-        }
-
-    if normalized_existing.strip():
-        append_block = (
-            f"{AUTO_AGENT_BLOCK_START}\n"
-            f"{normalized_template}\n"
-            f"{AUTO_AGENT_BLOCK_END}\n"
-        )
+    if stripped_existing:
         base_text = existing_text
         if base_text and not base_text.endswith(("\n", "\r")):
             base_text += "\n"
         if base_text and not base_text.endswith("\n\n"):
             base_text += "\n"
-        target_path.write_text(base_text + append_block, encoding="utf-8", newline="")
+        target_path.write_text(base_text + managed_block, encoding="utf-8", newline="")
         return {
             "path": str(target_path),
             "filename": target_filename,
             "workspace_root": str(workspace_root),
             "action": "appended",
+            "current_version": AUTO_AGENT_RULES_VERSION,
+            "existing_version": None,
         }
 
-    final_text = f"{normalized_template}\n"
-    target_path.write_text(final_text, encoding="utf-8", newline="")
+    target_path.write_text(managed_block, encoding="utf-8", newline="")
     action = "created" if not existed else "initialized"
     return {
         "path": str(target_path),
         "filename": target_filename,
         "workspace_root": str(workspace_root),
         "action": action,
+        "current_version": AUTO_AGENT_RULES_VERSION,
+        "existing_version": None,
     }
 
 
@@ -617,7 +703,7 @@ def _enforce_agent_file_gate(tool_name: str) -> None:
         ) from e
 
     action = _compact_text(result.get("action"), "") if isinstance(result, dict) else ""
-    if action in {"created", "initialized", "appended"}:
+    if action in {"created", "initialized", "appended", "updated", "versioned"}:
         state = _load_control_state()
         _append_guard_audit(
             state,
