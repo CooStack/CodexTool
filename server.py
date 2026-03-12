@@ -15,6 +15,7 @@ import time
 import traceback
 import urllib.request
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from typing import Any, Callable, Optional, Tuple, Union
@@ -25,6 +26,11 @@ from toolmodules.extensions.common import install_package_with_pip
 SERVER_NAME = "CodexTools"
 SERVER_VERSION = "0.8.1"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+BASE_DIR = Path(__file__).resolve().parent
+CAPABILITY_DIR = BASE_DIR / "capabilities"
+CAPABILITY_INDEX_PATH = CAPABILITY_DIR / "INDEX.md"
+CAPABILITY_DECLARATION_PATH = CAPABILITY_DIR / "declaration.json"
+CAPABILITY_RESOURCE_PREFIX = "codextools://capabilities"
 
 
 def _log(msg: str) -> None:
@@ -743,6 +749,22 @@ def _primary_command_name(tokens: list[str]) -> str:
     return Path(head).name.lower()
 
 
+def _normalize_proc_run_batch_item(item: Any, index: int, default_reason: str) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise ValueError(f"`commands[{index}]` must be an object")
+    if "command" not in item:
+        raise ValueError(f"`commands[{index}].command` is required")
+
+    normalized: dict[str, Any] = {
+        "command": item["command"],
+        "reason": default_reason,
+    }
+    for key in ("cwd", "timeout_sec", "shell", "env"):
+        if key in item:
+            normalized[key] = item[key]
+    return normalized
+
+
 def _enforce_proc_run_policy(args: dict[str, Any]) -> None:
     state = _load_control_state()
     guard = _ensure_guard_policy_state(state)
@@ -805,11 +827,24 @@ def _enforce_proc_run_policy(args: dict[str, Any]) -> None:
         raise PermissionError(message)
 
 
+def _enforce_proc_run_batch_policy(args: dict[str, Any]) -> None:
+    reason = args.get("reason")
+    raw_commands = args.get("commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        raise ValueError("`commands` must be a non-empty array")
+
+    default_reason = reason if isinstance(reason, str) else ""
+    for index, item in enumerate(raw_commands):
+        _enforce_proc_run_policy(_normalize_proc_run_batch_item(item, index, default_reason))
+
+
 def _enforce_tool_policy(name: str, args: dict[str, Any]) -> None:
     _enforce_agent_file_gate(name)
 
     if name in {"proc_run", "debug_run", "perf_benchmark"}:
         _enforce_proc_run_policy(args)
+    elif name == "proc_run_batch":
+        _enforce_proc_run_batch_policy(args)
 
 
 
@@ -2381,7 +2416,7 @@ def _normalize_command(command: Any, shell_mode: bool) -> Union[str, list[str]]:
     raise ValueError("`command` must be a string or string array")
 
 
-def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
+def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
     if "command" not in args:
         raise ValueError("`command` is required")
 
@@ -2451,6 +2486,46 @@ def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
             "stdout": "",
             "stderr": f"FileNotFoundError: {e}. Try shell=true or use full path.",
         }
+
+
+def tool_proc_run(args: dict[str, Any]) -> dict[str, Any]:
+    return _run_proc_command(args)
+
+
+def tool_proc_run_batch(args: dict[str, Any]) -> dict[str, Any]:
+    reason = _require_str(args, "reason")
+    raw_commands = args.get("commands")
+    if not isinstance(raw_commands, list) or not raw_commands:
+        raise ValueError("`commands` must be a non-empty array")
+
+    continue_on_error = _as_bool(args.get("continue_on_error"), True)
+    results: list[dict[str, Any]] = []
+    aborted = False
+
+    for index, item in enumerate(raw_commands):
+        result = _run_proc_command(_normalize_proc_run_batch_item(item, index, reason))
+        result["index"] = index
+        results.append(result)
+
+        failed = bool(result.get("timed_out")) or result.get("returncode") not in (0, None)
+        if failed and not continue_on_error:
+            aborted = True
+            break
+
+    failed_count = sum(
+        1
+        for result in results
+        if bool(result.get("timed_out")) or result.get("returncode") not in (0, None)
+    )
+    return {
+        "reason": reason,
+        "continue_on_error": continue_on_error,
+        "requested_count": len(raw_commands),
+        "executed_count": len(results),
+        "failed_count": failed_count,
+        "aborted": aborted,
+        "results": results,
+    }
 
 
 def tool_img_draw(args: dict[str, Any]) -> dict[str, Any]:
@@ -2601,6 +2676,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Union[dict[str, Any], str]]]
     "fs_copy_file": tool_fs_copy_file,
     "fs_create": tool_fs_create,
     "proc_run": tool_proc_run,
+    "proc_run_batch": tool_proc_run_batch,
     "img_draw": tool_img_draw,
     "sound_beep": tool_sound_beep,
 }
@@ -2623,6 +2699,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "fs_copy_file": "Copy a single file from source to destination.",
     "fs_create": "Create a file or directory. Use kind=file|dir.",
     "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Requires `reason` and blocks shell/file-text operations that should use fs tools.",
+    "proc_run_batch": "Execute multiple shell commands sequentially and capture UTF-8 stdout/stderr for each result. Applies the same policy restrictions as `proc_run`.",
     "img_draw": "Draw an image with primitive shapes (line, rect, ellipse, text, polygon). Requires Pillow.",
     "sound_beep": "Play a beep notification sound.",
 }
@@ -2859,6 +2936,31 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["command", "reason"],
         "additionalProperties": False,
     },
+    "proc_run_batch": {
+        "type": "object",
+        "properties": {
+            "commands": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                        "cwd": {"type": "string"},
+                        "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
+                        "shell": {"type": "boolean", "default": False},
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables to set"},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+            "reason": {"type": "string", "description": "Explain why CodexTools fs tools are insufficient for these commands."},
+            "continue_on_error": {"type": "boolean", "default": True, "description": "If false, stop after the first failed or timed-out command."},
+        },
+        "required": ["commands", "reason"],
+        "additionalProperties": False,
+    },
     "img_draw": {
         "type": "object",
         "properties": {
@@ -2892,6 +2994,199 @@ for _tool_name in _EXTENSION_HANDLERS.keys():
 TOOL_HANDLERS.update(_EXTENSION_HANDLERS)
 TOOL_DESCRIPTIONS.update(_EXTENSION_DESCRIPTIONS)
 TOOL_SCHEMAS.update(_EXTENSION_SCHEMAS)
+
+
+def _read_utf8_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _load_capability_declaration() -> dict[str, Any]:
+    raw = json.loads(_read_utf8_text(CAPABILITY_DECLARATION_PATH))
+    if not isinstance(raw, dict):
+        raise ValueError("capability declaration must be a JSON object")
+    return raw
+
+
+def _tool_matches_capability_rule(tool_name: str, rule: dict[str, Any]) -> bool:
+    match = rule.get("match")
+    if not isinstance(match, dict):
+        return False
+
+    exact = match.get("exact")
+    if isinstance(exact, list) and tool_name in exact:
+        return True
+
+    prefixes = match.get("prefix")
+    if isinstance(prefixes, list):
+        for prefix in prefixes:
+            if isinstance(prefix, str) and prefix and tool_name.startswith(prefix):
+                return True
+
+    return False
+
+
+def _classify_tool_capability(tool_name: str) -> dict[str, Any]:
+    declaration = _load_capability_declaration()
+    default_classification = declaration.get("defaultClassification")
+    if not isinstance(default_classification, dict):
+        raise ValueError("capability declaration missing `defaultClassification`")
+
+    classification = deepcopy(default_classification)
+    matched_rule: Optional[dict[str, Any]] = None
+    for rule in declaration.get("classificationRules", []):
+        if isinstance(rule, dict) and _tool_matches_capability_rule(tool_name, rule):
+            matched_rule = rule
+            break
+
+    if matched_rule is not None:
+        for key, value in matched_rule.items():
+            if key != "match":
+                classification[key] = deepcopy(value)
+
+    classification["matched"] = bool(matched_rule)
+    return classification
+
+
+def _capability_levels_by_id(declaration: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    levels_raw = declaration.get("levels")
+    if not isinstance(levels_raw, list):
+        return {}
+
+    levels: dict[str, dict[str, Any]] = {}
+    for item in levels_raw:
+        if not isinstance(item, dict):
+            continue
+        level_id = item.get("id")
+        if isinstance(level_id, str) and level_id:
+            levels[level_id] = item
+    return levels
+
+
+def _capability_resource(uri: str, *, text: str, mime_type: str) -> dict[str, Any]:
+    return {
+        "uri": uri,
+        "mimeType": mime_type,
+        "text": text,
+    }
+
+
+def _list_capability_resources() -> list[dict[str, Any]]:
+    declaration = _load_capability_declaration()
+    resources = [
+        {
+            "uri": f"{CAPABILITY_RESOURCE_PREFIX}/index",
+            "name": "CodexTools Capability Index",
+            "description": "Overview of the standalone capability declaration and recommended query flow.",
+            "mimeType": "text/markdown",
+        },
+        {
+            "uri": f"{CAPABILITY_RESOURCE_PREFIX}/declaration",
+            "name": "CodexTools Capability Declaration",
+            "description": "Raw JSON declaration with levels, categories, and classification rules.",
+            "mimeType": "application/json",
+        },
+    ]
+
+    for level in declaration.get("levels", []):
+        if not isinstance(level, dict):
+            continue
+        level_id = level.get("id")
+        level_name = level.get("name")
+        if not isinstance(level_id, str) or not level_id:
+            continue
+        label = level_name if isinstance(level_name, str) and level_name else level_id
+        resources.append(
+            {
+                "uri": f"{CAPABILITY_RESOURCE_PREFIX}/levels/{level_id}",
+                "name": f"Capability Level {level_id}",
+                "description": f"{label} capability tier with currently registered tools.",
+                "mimeType": "application/json",
+            }
+        )
+
+    return resources
+
+
+def _list_capability_resource_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "uriTemplate": f"{CAPABILITY_RESOURCE_PREFIX}/tools/{{name}}",
+            "name": "CodexTools Capability By Tool",
+            "description": "Resolve a tool's capability level, risk, notes, description, and input schema.",
+            "mimeType": "application/json",
+        }
+    ]
+
+
+def _build_tool_capability_payload(tool_name: str) -> dict[str, Any]:
+    if tool_name not in TOOL_HANDLERS:
+        raise ValueError(f"unknown capability tool: {tool_name}")
+
+    declaration = _load_capability_declaration()
+    levels = _capability_levels_by_id(declaration)
+    classification = _classify_tool_capability(tool_name)
+    level_id = classification.get("level")
+    level_meta = levels.get(level_id, {}) if isinstance(level_id, str) else {}
+
+    return {
+        "tool": tool_name,
+        "resourceUri": f"{CAPABILITY_RESOURCE_PREFIX}/tools/{tool_name}",
+        "description": TOOL_DESCRIPTIONS[tool_name],
+        "inputSchema": TOOL_SCHEMAS[tool_name],
+        "classification": classification,
+        "levelMeta": level_meta,
+    }
+
+
+def _build_level_capability_payload(level_id: str) -> dict[str, Any]:
+    declaration = _load_capability_declaration()
+    levels = _capability_levels_by_id(declaration)
+    level_meta = levels.get(level_id)
+    if not isinstance(level_meta, dict):
+        raise ValueError(f"unknown capability level: {level_id}")
+
+    tools: list[dict[str, Any]] = []
+    for tool_name in sorted(TOOL_HANDLERS.keys()):
+        classification = _classify_tool_capability(tool_name)
+        if classification.get("level") != level_id:
+            continue
+        tools.append(
+            {
+                "tool": tool_name,
+                "category": classification.get("category"),
+                "risk": classification.get("risk"),
+                "description": TOOL_DESCRIPTIONS[tool_name],
+                "searchTags": classification.get("searchTags", []),
+            }
+        )
+
+    return {
+        "level": level_meta,
+        "toolCount": len(tools),
+        "tools": tools,
+    }
+
+
+def _read_capability_resource(uri: str) -> dict[str, Any]:
+    parsed = urlparse(uri)
+    prefix = f"{parsed.scheme}://{parsed.netloc}"
+    if prefix != CAPABILITY_RESOURCE_PREFIX:
+        raise ValueError(f"unknown resource uri: {uri}")
+
+    path = parsed.path or "/"
+    if path == "/index":
+        return _capability_resource(uri, text=_read_utf8_text(CAPABILITY_INDEX_PATH), mime_type="text/markdown")
+    if path == "/declaration":
+        return _capability_resource(uri, text=_read_utf8_text(CAPABILITY_DECLARATION_PATH), mime_type="application/json")
+    if path.startswith("/levels/"):
+        level_id = unquote(path.rsplit("/", 1)[-1]).strip()
+        payload = _build_level_capability_payload(level_id)
+        return _capability_resource(uri, text=json.dumps(payload, ensure_ascii=False, indent=2), mime_type="application/json")
+    if path.startswith("/tools/"):
+        tool_name = unquote(path.rsplit("/", 1)[-1]).strip()
+        payload = _build_tool_capability_payload(tool_name)
+        return _capability_resource(uri, text=json.dumps(payload, ensure_ascii=False, indent=2), mime_type="application/json")
+    raise ValueError(f"unknown resource uri: {uri}")
 
 
 def _read_message(stdin: Any) -> Tuple[Optional[dict[str, Any]], str]:
@@ -2958,7 +3253,10 @@ def _handle(method: str, params: dict[str, Any]) -> Optional[dict[str, Any]]:
         _capture_runtime_workspace_hint(params)
         return {
             "protocolVersion": protocol,
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "resources": {"subscribe": False, "listChanged": False},
+            },
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }
 
@@ -2999,9 +3297,20 @@ def _handle(method: str, params: dict[str, Any]) -> Optional[dict[str, Any]]:
     if method.startswith("notifications/"):
         return None
 
-    if method in {"resources/list", "prompts/list"}:
-        key = "resources" if method == "resources/list" else "prompts"
-        return {key: []}
+    if method == "resources/list":
+        return {"resources": _list_capability_resources()}
+
+    if method == "resources/templates/list":
+        return {"resourceTemplates": _list_capability_resource_templates()}
+
+    if method == "resources/read":
+        uri = params.get("uri")
+        if not isinstance(uri, str) or not uri.strip():
+            raise ValueError("resources/read missing `uri`")
+        return {"contents": [_read_capability_resource(uri.strip())]}
+
+    if method == "prompts/list":
+        return {"prompts": []}
 
     raise ValueError(f"method not found: {method}")
 

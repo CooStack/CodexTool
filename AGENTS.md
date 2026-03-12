@@ -1,16 +1,21 @@
 # Workspace Agent Policy
 
-- MUST use MCP server `CodexTools` tools for repository discovery, reads, and routine code, file, and text operations; for existing-file manual edits, MUST use `apply_patch` by default.
-- MUST NOT use shell commands, shell redirection, or shell text utilities for any code, file, or text operation.
+Policy Version: 1.2.1
+Last Updated: 2026-03-12
+
+- MUST use MCP server `CodexTools` tools for repository discovery, reads, and routine code, file, and text operations.
+- MUST NOT use shell commands, shell redirection, or shell text utilities unless an MCP capability itself depends on shell or the task objectively cannot be completed without shell.
+- In all other cases, shell usage is forbidden and MCP/native workspace tools must be used instead.
+- Any modification to `AGENTS.md` must increment `Policy Version` and update `Last Updated`.
 - Read only with `mcp__CodexTools__fs_read_text` or `mcp__CodexTools__fs_read_texts`.
-- Write/create/append only with `mcp__CodexTools__fs_write_text` or `mcp__CodexTools__fs_create`.
-- MUST use `apply_patch` for manual code patch modifications by default. Only when `apply_patch` cannot express the required text change cleanly or safely may you use `mcp__CodexTools__fs_replace_text`, `mcp__CodexTools__fs_replace_regex`, or `mcp__CodexTools__fs_patch_lines`.
-- For existing-file edits, use `apply_patch` unless you have a concrete reason it cannot handle the text change cleanly; compatible IDE clients can then present structured edited-file/diff UI.
-- Avoid `mcp__CodexTools__fs_write_text` for modifying existing files unless a full rewrite is genuinely safer or the patch tools cannot express the change cleanly.
-- Batch related edits into as few `apply_patch` operations as practical to improve edited-file grouping in compatible clients such as Claude Code GUI IDEA integrations.
+- Existing-file text modifications MUST use `apply_patch`.
+- Only when `apply_patch` cannot express the change cleanly or safely may text edits fall back to `mcp__CodexTools__fs_replace_text`, `mcp__CodexTools__fs_replace_regex`, or `mcp__CodexTools__fs_patch_lines`.
+- New-file creation or full-file writes may use `mcp__CodexTools__fs_write_text` or `mcp__CodexTools__fs_create`.
+- Batch related edits into as few `apply_patch` operations as practical.
 - Use `mcp__CodexTools__fs_list`, `mcp__CodexTools__fs_list_files`, `mcp__CodexTools__fs_stat`, and `mcp__CodexTools__fs_search_text` for discovery and search.
 - Prefer `mcp__CodexTools__fs_read_texts` for disjoint multi-range reads.
 - Prefer Codex native plan capability for substantial tasks; do not reimplement plan tools in this workspace.
+- If the task is complex, cross-module, ambiguous, or requires multi-step reasoning, use `Sequential-thinking` MCP for structured thinking when available.
 - For OpenAI computer use or custom computer harness flows, call `computer_use_request_consent` before any native desktop or browser screenshot/action unless consent is already granted for the current session.
 - If a step requires passwords, MFA, captchas, payment confirmation, or other sensitive manual input, do not automate it; use `computer_use_manual_prompt` and wait for the user.
 - Use manual interaction mode for end-user input tools unless the user explicitly requests automation.
@@ -26,10 +31,11 @@
 
 ## Nexus Map And Structure Rules
 
-- `.nexus-map/` 存在时：开始任务前必须先读 `INDEX.md` 恢复上下文，并按其中的路由块决定下一步动作。
-- `.nexus-map/` 不存在时：跨模块或接口修改前，先向用户提议运行 `nexus-mapper`；若用户需立即开始，至少先运行 `query_graph.py --summary` 建立结构感知，不要对陌生仓库盲改核心接口。
-- 结构查询：任何时候需要判断依赖关系、影响半径或边界归属，优先用 `query_graph.py` 验证，不要凭目录名猜测。
-- 知识库同步：任务中若改变了系统边界、入口或依赖关系，完成后评估是否需要重新运行 `nexus-mapper` 更新 `.nexus-map`。
+- Only apply this section when the user's request is directly related to the current project's code, architecture, module boundaries, interface impact, or dependency structure.
+- If `.nexus-map/` exists, read `INDEX.md` before starting project-related work and follow its routing guidance.
+- If `.nexus-map/` does not exist and the task involves cross-module or interface changes, propose running `nexus-mapper` first; if the user wants immediate work, establish minimal structural awareness before editing unfamiliar core code.
+- When you need to judge dependencies, impact radius, or ownership boundaries, prefer structure queries instead of guessing from directory names.
+- If the task changes system boundaries, entries, or dependency relationships, assess whether `.nexus-map` should be refreshed afterward.
     
 <!-- codextools:auto-agent-rules:v2:start -->
 # Agent Rules

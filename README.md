@@ -133,6 +133,54 @@ args = ["-u", "-X", "utf8", "D:/python/CodexTools/server.py"]
 enabled = true
 ```
 
+## 批量命令工具
+
+内置工具 `proc_run_batch` 用于按顺序执行多条命令，并返回每条命令各自的 `stdout`、`stderr`、`returncode` 和耗时。
+
+它沿用 `proc_run` 的同一套策略限制：
+- 必须提供 `reason`
+- 仍然禁止 `shell=true`
+- 仍然禁止重定向、管道和文件/文本类 shell 工具替代 `fs_*`
+
+示例：
+
+```json
+{
+  "commands": [
+    { "command": ["python", "--version"] },
+    { "command": ["git", "status"], "cwd": "D:/python/CodexTools" }
+  ],
+  "reason": "Need to gather runtime and repo state in one tool call.",
+  "continue_on_error": true
+}
+```
+
+## 能力声明资源
+
+CodexTools 现在提供独立于 `AGENTS.md` 的能力声明，供调用方 AI 通过 MCP resources 直接查询。
+
+资源入口：
+
+- `codextools://capabilities/index`
+- `codextools://capabilities/declaration`
+- `codextools://capabilities/levels/L1`
+- `codextools://capabilities/levels/L2`
+- `codextools://capabilities/levels/L3`
+- `codextools://capabilities/levels/L4`
+- `codextools://capabilities/tools/{name}`
+
+分级含义：
+
+- `L1`：只读检查、搜索、摘要或被动 payload 构造
+- `L2`：文件修改、目录变更、生成持久化产物
+- `L3`：本地命令执行、调试、基准测试
+- `L4`：原生 UI、浏览器、桌面接管、需要人工交互或同意的能力
+
+声明文件位于：
+
+- [`capabilities/INDEX.md`](/D:/python/CodexTools/capabilities/INDEX.md)
+- [`capabilities/declaration.json`](/D:/python/CodexTools/capabilities/declaration.json)
+
 ## 命名变更
 
 - 旧服务名：`utf8-toolbox`
