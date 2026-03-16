@@ -1,0 +1,45 @@
+package {{package_name}}.graphics;
+
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+@Tag("gpu")
+@Tag("golden")
+@ExtendWith(ShaderTestExtension.class)
+public final class OffscreenShaderGoldenTest {
+    private final ShaderSceneRunner sceneRunner = new ShaderSceneRunner();
+    private final ShaderDebugCapture debugCapture = new ShaderDebugCapture();
+    private final ShaderBaselineComparator comparator = new ShaderBaselineComparator();
+    private final ShaderProbeRecorder probeRecorder = new ShaderProbeRecorder();
+    private final ShaderCaptureManifestWriter manifestWriter = new ShaderCaptureManifestWriter();
+
+    @Test
+    void glowSphereCompositeEmitsAiReadableArtifacts(ShaderTestRuntime runtime) throws Exception {
+        ShaderSceneManifest scene = ShaderSceneManifest.load(runtime.sceneRoot().resolve("glow-sphere.default.json"));
+        Path outputDir = runtime.artifactRoot().resolve("glow-sphere/default");
+        Files.createDirectories(outputDir);
+
+        Path actualImage = outputDir.resolve("actual.png");
+        Path metadataJson = outputDir.resolve("metadata.json");
+        Path probeJson = outputDir.resolve("probe.json");
+        Path metricsJson = outputDir.resolve("metrics.json");
+        Path diffImage = outputDir.resolve("diff.png");
+        Path captureManifestJson = outputDir.resolve("capture-manifest.json");
+
+        ShaderRenderResult renderResult = sceneRunner.render(scene, runtime, actualImage);
+        sceneRunner.writeMetadata(renderResult, metadataJson);
+        ShaderPassCaptureResult passCaptureResult = debugCapture.capturePassOutputs(scene, outputDir.resolve("passes"));
+        ShaderProbeResult probeResult = probeRecorder.record(scene, probeJson);
+        ShaderCompareResult compareResult = comparator.compareIfPresent(scene, runtime.projectRoot(), actualImage, metricsJson, diffImage);
+
+        manifestWriter.write(scene, renderResult, passCaptureResult, probeResult, compareResult, captureManifestJson);
+
+        if (compareResult != null && !compareResult.matchesBaseline()) {
+            throw new AssertionError("Baseline comparison failed. See " + captureManifestJson + " for capture details.");
+        }
+    }
+}

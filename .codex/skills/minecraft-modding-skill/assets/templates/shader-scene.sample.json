@@ -1,0 +1,43 @@
+{
+  "scene_id": "glow-sphere/default",
+  "render_pass": "post-process",
+  "pipeline_variant": "single-pass",
+  "viewport": {
+    "width": 512,
+    "height": 512
+  },
+  "time_seconds": 1.25,
+  "seed": 7,
+  "camera": {
+    "projection": "identity",
+    "view": "identity"
+  },
+  "depth_source": "none",
+  "textures": [
+    {
+      "name": "noise",
+      "path": "textures/test/noise.png",
+      "sampler": {
+        "min_filter": "linear",
+        "mag_filter": "linear",
+        "wrap_s": "repeat",
+        "wrap_t": "repeat"
+      }
+    }
+  ],
+  "input_channels": [
+    {
+      "name": "scene_color",
+      "source": "generated-flat-color"
+    }
+  ],
+  "global_uniforms": {
+    "uTime": 1.25,
+    "uViewport": [512.0, 512.0]
+  },
+  "uniforms": {
+    "uGlowColor": [0.1, 0.6, 1.0, 1.0],
+    "uGlowRadius": 12.0
+  },
+  "baseline": "src/test/resources/shader-baselines/glow-sphere/default.png"
+}

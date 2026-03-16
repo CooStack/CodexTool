@@ -1,0 +1,33 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Path;
+
+public final class ShaderSceneRunner {
+    public ShaderRenderResult render(ShaderSceneManifest scene, ShaderTestRuntime runtime, Path outputImage) {
+        throw new UnsupportedOperationException("Render the manifest scene and write outputImage");
+    }
+
+    public void writeMetadata(ShaderRenderResult result, Path outputJson) {
+        throw new UnsupportedOperationException("Serialize result metadata to JSON");
+    }
+}
+
+record ShaderRenderResult(
+    String sceneId,
+    String pipelineVariant,
+    String glVersion,
+    String driver,
+    int viewportWidth,
+    int viewportHeight,
+    String actualImagePath
+) {}
+
+record ShaderSceneManifest(
+    String sceneId,
+    String pipelineVariant,
+    String baseline
+) {
+    static ShaderSceneManifest load(Path path) {
+        throw new UnsupportedOperationException("Load and validate the scene manifest JSON");
+    }
+}

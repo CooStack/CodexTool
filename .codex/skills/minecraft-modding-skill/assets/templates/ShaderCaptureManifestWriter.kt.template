@@ -1,0 +1,21 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Path
+
+class ShaderCaptureManifestWriter {
+
+    fun write(
+        scene: ShaderSceneManifest,
+        renderResult: ShaderRenderResult,
+        passCaptureResult: ShaderPassCaptureResult,
+        probeResult: ShaderProbeResult,
+        compareResult: ShaderCompareResult?,
+        outputJson: Path,
+    ) {
+        /*
+         * Write one manifest that indexes every artifact the AI should inspect.
+         * This is an artifact map, not an interpretation layer.
+         */
+        TODO("Write capture-manifest.json")
+    }
+}

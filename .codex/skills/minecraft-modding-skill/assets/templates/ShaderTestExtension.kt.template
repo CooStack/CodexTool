@@ -1,0 +1,79 @@
+package {{package_name}}.graphics
+
+import org.junit.jupiter.api.extension.AfterAllCallback
+import org.junit.jupiter.api.extension.BeforeAllCallback
+import org.junit.jupiter.api.extension.ExtensionContext
+import org.junit.jupiter.api.extension.ParameterContext
+import org.junit.jupiter.api.extension.ParameterResolver
+import java.nio.file.Files
+import java.nio.file.Path
+
+/**
+ * Own the hidden OpenGL context, stable artifact directories, and metadata used
+ * by offscreen tests against the project's standalone shader API.
+ *
+ * In a CooParticlesAPI-style project, this extension should serve tests that stay
+ * inside abstractions such as CooShaderProgram, GlFrameBuffer, VertexBuffer,
+ * GlTexture, ShaderPipe, and PipeLinker.
+ */
+class ShaderTestExtension : BeforeAllCallback, AfterAllCallback, ParameterResolver {
+    private lateinit var runtime: ShaderTestRuntime
+
+    override fun beforeAll(context: ExtensionContext) {
+        val projectRoot = Path.of("").toAbsolutePath()
+        val artifactRoot = projectRoot.resolve("build/test-artifacts/shaders")
+        Files.createDirectories(artifactRoot)
+
+        runtime = ShaderTestRuntime(
+            projectRoot = projectRoot,
+            artifactRoot = artifactRoot,
+            baselineRoot = projectRoot.resolve("src/test/resources/shader-baselines"),
+            sceneRoot = projectRoot.resolve("src/test/resources/shader-scenes"),
+            contextHandle = createHiddenContext(),
+            glVersion = queryGlVersion(),
+            driverString = queryDriverString(),
+        )
+    }
+
+    override fun afterAll(context: ExtensionContext) {
+        if (::runtime.isInitialized) {
+            destroyHiddenContext(runtime.contextHandle)
+        }
+    }
+
+    override fun supportsParameter(
+        parameterContext: ParameterContext,
+        extensionContext: ExtensionContext,
+    ): Boolean = parameterContext.parameter.type == ShaderTestRuntime::class.java
+
+    override fun resolveParameter(
+        parameterContext: ParameterContext,
+        extensionContext: ExtensionContext,
+    ): Any = runtime
+
+    private fun createHiddenContext(): Long {
+        TODO("Create a hidden GLFW or LWJGL OpenGL context here")
+    }
+
+    private fun destroyHiddenContext(handle: Long) {
+        TODO("Destroy the hidden OpenGL context here")
+    }
+
+    private fun queryGlVersion(): String {
+        TODO("Read GL_VERSION from the active context")
+    }
+
+    private fun queryDriverString(): String {
+        TODO("Read GL_VENDOR and GL_RENDERER from the active context")
+    }
+}
+
+data class ShaderTestRuntime(
+    val projectRoot: Path,
+    val artifactRoot: Path,
+    val baselineRoot: Path,
+    val sceneRoot: Path,
+    val contextHandle: Long,
+    val glVersion: String,
+    val driverString: String,
+)

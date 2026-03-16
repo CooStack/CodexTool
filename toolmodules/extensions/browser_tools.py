@@ -29,6 +29,10 @@ DEFAULT_TYPING_DELAY_MS = 90
 DEFAULT_MOUSE_MOVE_STEPS = 24
 DEFAULT_MOUSE_JITTER_PX = 4
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+DEFAULT_BROWSER_SNAPSHOT_MAX_HTML_CHARS = 1500
+DEFAULT_BROWSER_SNAPSHOT_MAX_TEXT_CHARS = 1500
+DEFAULT_BROWSER_READ_ACTIVE_MAX_HTML_CHARS = 1500
+DEFAULT_BROWSER_READ_ACTIVE_MAX_TEXT_CHARS = 2000
 
 SEARCH_ENGINE_PRESETS: dict[str, dict[str, Any]] = {
     "bing": {
@@ -994,8 +998,8 @@ def tool_browser_capture(args: dict[str, Any]) -> dict[str, Any]:
 
 def tool_browser_snapshot(args: dict[str, Any]) -> dict[str, Any]:
     session_id = require_str(args, "session_id")
-    max_html_chars = as_int(args.get("max_html_chars"), 4000, minimum=0, maximum=200000)
-    max_text_chars = as_int(args.get("max_text_chars"), 2000, minimum=0, maximum=200000)
+    max_html_chars = as_int(args.get("max_html_chars"), DEFAULT_BROWSER_SNAPSHOT_MAX_HTML_CHARS, minimum=0, maximum=200000)
+    max_text_chars = as_int(args.get("max_text_chars"), DEFAULT_BROWSER_SNAPSHOT_MAX_TEXT_CHARS, minimum=0, maximum=200000)
     timeout_ms = as_int(args.get("timeout_ms"), DEFAULT_TIMEOUT_MS, minimum=1, maximum=600000)
 
     session = _get_session(session_id)
@@ -1209,8 +1213,8 @@ def tool_browser_read_active(args: dict[str, Any]) -> dict[str, Any]:
                     "frame_index": args.get("frame_index"),
                     "frame_name": args.get("frame_name"),
                     "frame_url_contains": args.get("frame_url_contains"),
-                    "max_html_chars": as_int(args.get("max_html_chars"), 4000, minimum=0, maximum=200000),
-                    "max_text_chars": as_int(args.get("max_text_chars"), 4000, minimum=0, maximum=200000),
+                    "max_html_chars": as_int(args.get("max_html_chars"), DEFAULT_BROWSER_READ_ACTIVE_MAX_HTML_CHARS, minimum=0, maximum=200000),
+                    "max_text_chars": as_int(args.get("max_text_chars"), DEFAULT_BROWSER_READ_ACTIVE_MAX_TEXT_CHARS, minimum=0, maximum=200000),
                     "timeout_ms": as_int(args.get("timeout_ms"), DEFAULT_TIMEOUT_MS, minimum=1, maximum=600000),
                 }
             )
@@ -1456,7 +1460,7 @@ def get_browser_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dic
         "browser_session_stop": "Stop and dispose a browser debugging session.",
         "browser_session_list": "List active browser debugging sessions.",
         "browser_handoff_start": "Take over the current browser in auto mode: try CDP first, then fall back to visible desktop handoff.",
-        "browser_read_active": "Read the current browser content from an attached session or via desktop OCR handoff.",
+        "browser_read_active": "Read the current browser content with compact defaults from an attached session or via desktop OCR handoff.",
         "browser_frame_list": "List frames in the current page for iframe debugging.",
         "browser_navigate": "Navigate browser page to target URL.",
         "browser_press_key": "Press a keyboard key in the current browser page.",
@@ -1466,7 +1470,7 @@ def get_browser_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dic
         "browser_ask_visible_ai": "Open a visible AI site, type a prompt, and try to submit it; falls back to manual handoff if login is required.",
         "browser_eval": "Evaluate JavaScript in browser page or selected frame context.",
         "browser_capture": "Capture page screenshot and return PNG base64.",
-        "browser_snapshot": "Get page or selected frame URL/title plus HTML and text snapshot.",
+        "browser_snapshot": "Get page or selected frame URL/title plus compact HTML and text snapshot.",
     }
 
     base_browser_session_properties = {
@@ -1566,8 +1570,8 @@ def get_browser_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dic
                 "frame_index": {"type": "integer", "minimum": 0},
                 "frame_name": {"type": "string"},
                 "frame_url_contains": {"type": "string"},
-                "max_html_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": 4000},
-                "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": 4000},
+                "max_html_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": DEFAULT_BROWSER_READ_ACTIVE_MAX_HTML_CHARS},
+                "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": DEFAULT_BROWSER_READ_ACTIVE_MAX_TEXT_CHARS},
                 "full_page": {"type": "boolean", "default": True},
                 "force_reconfirm": {"type": "boolean", "default": False},
                 "region": {"type": "object"},
@@ -1733,8 +1737,8 @@ def get_browser_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dic
                 "frame_index": {"type": "integer", "minimum": 0},
                 "frame_name": {"type": "string"},
                 "frame_url_contains": {"type": "string"},
-                "max_html_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": 4000},
-                "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": 2000},
+                "max_html_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": DEFAULT_BROWSER_SNAPSHOT_MAX_HTML_CHARS},
+                "max_text_chars": {"type": "integer", "minimum": 0, "maximum": 200000, "default": DEFAULT_BROWSER_SNAPSHOT_MAX_TEXT_CHARS},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 30000}
             },
             "required": ["session_id"],

@@ -1,188 +1,138 @@
 # CodexTools MCP
 
-CodexTools 是一个基于 Python 的 MCP 工具服务，提供 UTF-8 文本读写、限量读取、批量搜索、批量替换、目录操作、命令执行、图片绘制和提示音能力。
+CodexTools 是一个本地运行的 MCP 服务，重点解决三类问题：
 
-## 策略约束
+- 让 AI 稳定地读写项目文件、搜索代码、生成补丁、执行必要命令
+- 提供桌面 GUI、浏览器接管、OCR、截图、人工确认等高级交互能力
+- 支持多 Agent 协作，包括规划、分工、审查和可视化面板
 
-- `tools/call` 放行前会先确保规则文件存在：Claude 模型使用 `CLAUDE.MD`，Codex/其他模型使用 `AGENTS.MD`。
-- 规则文件默认写入当前工作区根目录（优先 `initialize.rootUri/workspaceFolders`，其次 `CODEXTOOLS_WORKSPACE_ROOT`，再兜底服务启动工作目录）。
-- 若目标规则文件为空则写入当前版本受管规则块；若已有内容则只维护 `codextools:auto-agent-rules` 的 `start -> end` 受管区间：缺失时追加，发现无版本或旧版本时仅替换该块，避免覆盖其他 MCP 或用户自定义内容。
+如果你只关心“它能做什么、怎么装、为什么值得用”，看这份 README 就够了。
 
-## 启动
+## 它能做什么
+
+CodexTools 提供一组面向真实开发场景的 MCP 工具：
+
+- 文件与代码操作
+  - 读取、搜索、批量读取、替换、补丁修改、目录管理
+- 本地执行
+  - 运行命令、批量执行、调试、基准测试
+- 图形与交互
+  - 弹窗、进度条、图表、提示音
+- 浏览器能力
+  - 可见浏览器控制、页面读取、输入、点击、搜索、附着到现有浏览器
+- 桌面能力
+  - OCR、截图、坐标点击、人工接管提示、桌面级 computer-use
+- 多 Agent 协作
+  - 角色分工、任务编排、聊天式活动流、Dashboard GUI、草稿与交接文档
+- 自带项目技能
+  - `codextoolSkill`：角色化多 Agent 工作流
+  - `minecraft-modding-skill`：Minecraft Mod 开发专项工作流
+
+## 它的优势
+
+- 本地优先
+  - 服务直接运行在你的机器上，适合真实项目目录、真实浏览器、真实 GUI 操作。
+- 工具面完整
+  - 不只是读文件和跑命令，还覆盖了 GUI、浏览器、OCR、多 Agent 这些高价值能力。
+- 对工程任务更友好
+  - 更强调补丁式改动、结构化输出、面板可视化和持久化协作产物。
+- 可直接扩展
+  - 仓库内已经带了 skills，安装后可以直接复用，不需要再单独找模板。
+- 一键安装
+  - 现在可以直接运行 `install.bat` 或 `install.py`，自动装依赖、写配置、复制所选 skills。
+
+## 安装
+
+### 环境要求
+
+- Windows
+- Python 3.10+
+
+### 方案 1：安装 MCP + Skills
+
+安装器会安装 `CodexTools MCP`，并让你选择这两个 skill：
+
+- `codextoolSkill`
+- `minecraft-modding-skill`
+
+运行：
+
+```bat
+install.bat
+```
+
+或：
 
 ```powershell
-python -u -X utf8 D:/python/CodexTools/server.py
+python install.py
 ```
 
-依赖安装：
+### 方案 2：只安装 MCP
 
-- 默认会在首次调用相关工具时自动尝试 `pip` 安装缺失依赖（使用当前 Python 解释器执行 `python -m pip install ...`）。
-- 也可以提前手动安装，避免首次调用等待：
+运行：
 
 ```powershell
-python -m pip install pillow matplotlib playwright
+python install.py --skills none
 ```
 
-- `img_draw` 依赖 `pillow`（缺失时自动安装）
-- `ui_line_chart` 依赖 `matplotlib`（缺失时自动安装）
-- 浏览器调试工具依赖 `playwright`（缺失时自动安装包；浏览器二进制仍需按提示执行 `playwright install`）
-- `ui_dialog_input` 使用 `tkinter`（Python 标准库，需系统图形界面可用）
+### MCP 接入方式
 
-## 浏览器调试器（更像真人操作）
+安装完成后，重启你的 Codex 或支持 MCP 的客户端，确认已经启用：
 
-参考 `chrome-devtools-mcp` 的使用体验，浏览器调试工具现在默认更偏“真人可见操作”：
+- MCP Server 名称：`CodexTools`
 
-- `browser_session_start` 默认 `headless=false`，会直接打开可见浏览器窗口。
-- 默认 `bring_to_front=true`，在关键操作前尽量把页面切到前台，方便用户观察。
-- 默认 `human_like=true`，`browser_click` / `browser_type` 会使用更像真人的鼠标移动、点击停顿和键盘逐字输入。
-- `chromium` 默认 `prefer_real_chrome=true`，会优先尝试启动本机 `chrome` 渠道；如果失败会自动回退到 Playwright 自带浏览器。
-- 默认 `slow_mo_ms=120`、`typing_delay_ms=90`、`pre_action_delay_ms=120`、`post_action_delay_ms=180`，避免操作过于“秒点秒填”。
-- 新增 `browser_frame_list`，并让 `browser_click` / `browser_type` / `browser_eval` / `browser_snapshot` 支持 `frame_index`、`frame_name`、`frame_url_contains`，方便调试 `iframe` 内的页面模块。
-- 新增 `browser_session_attach`，可通过 CDP 附着到用户已经打开的 Chromium/Chrome/Edge 浏览器；停止会话时只“脱离”不会关闭用户真实浏览器。
-- 新增 `browser_handoff_start` / `browser_read_active`：可优先尝试 CDP 接管当前浏览器，失败时自动回退到桌面 OCR 读取与接手模式。
-- 新增 `browser_press_key`、`browser_search_visible`、`browser_ask_visible_ai`：支持可见浏览器搜索、在 AI 网站里尝试自动提问，并在需要登录时切换为人工接管。
+项目内会生成配置样例：
 
-示例：
+- [mcp.codextools.json](/D:/python/CodexTools/mcp.codextools.json)
+- [codex.config.codextools.toml](/D:/python/CodexTools/codex.config.codextools.toml)
 
-```json
-{
-  "browser": "chromium",
-  "url": "https://example.com",
-  "human_like": true,
-  "bring_to_front": true
-}
-```
+服务启动入口：
 
-如果需要直接接手用户已经打开的 Chrome / Edge，可先用远程调试端口启动浏览器，例如：
+- [server.py](/D:/python/CodexTools/server.py)
+
+## 推荐使用方式
+
+如果你要体验多 Agent 面板或聊天式协作流，优先安装：
+
+- `codextoolSkill`
+
+如果你主要做 Minecraft Mod、Forge、Fabric、NeoForge 或相关 JVM 项目，建议同时安装：
+
+- `minecraft-modding-skill`
+
+## 仓库内重要文件
+
+- 服务入口: [server.py](/D:/python/CodexTools/server.py)
+- 一键安装脚本: [install.py](/D:/python/CodexTools/install.py)
+- Windows 启动脚本: [install.bat](/D:/python/CodexTools/install.bat)
+- 多 Agent skill: [SKILL.md](/D:/python/CodexTools/.codex/skills/codextoolSkill/SKILL.md)
+- Minecraft skill: [SKILL.md](/D:/python/CodexTools/.codex/skills/minecraft-modding-skill/SKILL.md)
+
+## 常见问题
+
+### 1. 安装器会不会覆盖我现有的 Codex 配置？
+
+不会整份覆盖。安装器只会维护一段带标记的 `CodexTools` 配置块。
+
+### 2. skills 会装到哪里？
+
+会复制到这两个目录，便于不同代理环境直接发现：
+
+- `~/.codex/skills`
+- `~/.agents/skills`
+
+### 3. Playwright 浏览器安装失败怎么办？
+
+先完成主安装，再手动执行：
 
 ```powershell
-chrome.exe --remote-debugging-port=9222
+D:/python/CodexTools/.venv/Scripts/python.exe -m playwright install chromium
 ```
 
-然后调用 `browser_handoff_start`（`mode=auto`）或 `browser_session_attach`。如果当前浏览器没有开启 CDP，工具会自动回退到桌面 OCR 接手模式。
+### 4. 如何确认安装成功？
 
-如果需要回到纯自动化速度，也可以显式传参覆盖：
+看这三项：
 
-```json
-{
-  "headless": true,
-  "human_like": false,
-  "slow_mo_ms": 0,
-  "typing_delay_ms": 0
-}
-```
-
-## 用户输入交互（ui_dialog_input）
-
-默认是手动交互模式（不会自动提交），会尝试置顶并抢焦点，适合真实用户输入场景。
-
-手动交互示例：
-
-```json
-{
-  "title": "请输入审批意见",
-  "prompt": "请填写说明后点击按钮",
-  "button1_label": "提交",
-  "button2_label": "取消"
-}
-```
-
-自动化测试示例（仅测试时使用）：
-
-```json
-{
-  "title": "自动化测试",
-  "prompt": "该窗口将自动提交",
-  "default": "test",
-  "auto_submit_after_ms": 200,
-  "auto_button": "button1"
-}
-```
-    
-## 计划确认弹窗（继续/修改）
-
-`ui_plan_confirm` 可用于可选的计划复核流程，不再作为写操作的硬性前置闸门：
-- 点击“继续”：记录当前计划已确认，可继续执行。
-- 点击“修改计划”：按提示编辑当前工作区根目录下的 `<工作区名>-plan.md`，然后可再次复核。
-
-该弹窗默认手动交互，不自动提交。
-
-## MCP 配置（JSON）
-
-文件：`D:/python/CodexTools/mcp.codextools.json`
-
-```json
-{
-  "mcpServers": {
-    "CodexTools": {
-      "command": "python",
-      "args": ["-u", "-X", "utf8", "your/path/CodexTools/server.py"]
-    }
-  }
-}
-```
-
-## MCP 配置（TOML）
-
-文件：`D:/python/CodexTools/codex.config.codextools.toml`
-
-```toml
-[mcp_servers.CodexTools]
-command = "python"
-args = ["-u", "-X", "utf8", "D:/python/CodexTools/server.py"]
-enabled = true
-```
-
-## 批量命令工具
-
-内置工具 `proc_run_batch` 用于按顺序执行多条命令，并返回每条命令各自的 `stdout`、`stderr`、`returncode` 和耗时。
-
-它沿用 `proc_run` 的同一套策略限制：
-- 必须提供 `reason`
-- 仍然禁止 `shell=true`
-- 仍然禁止重定向、管道和文件/文本类 shell 工具替代 `fs_*`
-
-示例：
-
-```json
-{
-  "commands": [
-    { "command": ["python", "--version"] },
-    { "command": ["git", "status"], "cwd": "D:/python/CodexTools" }
-  ],
-  "reason": "Need to gather runtime and repo state in one tool call.",
-  "continue_on_error": true
-}
-```
-
-## 能力声明资源
-
-CodexTools 现在提供独立于 `AGENTS.md` 的能力声明，供调用方 AI 通过 MCP resources 直接查询。
-
-资源入口：
-
-- `codextools://capabilities/index`
-- `codextools://capabilities/declaration`
-- `codextools://capabilities/levels/L1`
-- `codextools://capabilities/levels/L2`
-- `codextools://capabilities/levels/L3`
-- `codextools://capabilities/levels/L4`
-- `codextools://capabilities/tools/{name}`
-
-分级含义：
-
-- `L1`：只读检查、搜索、摘要或被动 payload 构造
-- `L2`：文件修改、目录变更、生成持久化产物
-- `L3`：本地命令执行、调试、基准测试
-- `L4`：原生 UI、浏览器、桌面接管、需要人工交互或同意的能力
-
-声明文件位于：
-
-- [`capabilities/INDEX.md`](/D:/python/CodexTools/capabilities/INDEX.md)
-- [`capabilities/declaration.json`](/D:/python/CodexTools/capabilities/declaration.json)
-
-## 命名变更
-
-- 旧服务名：`utf8-toolbox`
-- 新服务名：`CodexTools`
-- 推荐 MCP server id：`CodexTools`
+1. `.venv` 已创建
+2. `~/.codex/config.toml` 中存在 `CodexTools` 配置
+3. 客户端重启后能看到 `CodexTools` MCP 服务

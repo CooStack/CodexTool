@@ -1,0 +1,53 @@
+package {{package_name}}.graphics;
+
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+@Tag("smoke")
+public final class MinecraftShaderSmokeTest {
+    private final SmokeClientHarness client = SmokeClientHarness.attachOrLaunch();
+
+    @Test
+    void shaderSurvivesResourceReloadInWorldPass() throws Exception {
+        Path outputDir = Path.of("build/test-artifacts/shaders/smoke/world-pass-reload");
+        Files.createDirectories(outputDir);
+        client.loadTestWorld("shader-smoke-flat");
+        client.enableShader("glow-sphere");
+        client.reloadResources();
+        client.waitForFrameBoundary("world-pass");
+        client.captureFrame(outputDir.resolve("frame.png"));
+        client.assertNoOpenGlErrors();
+        client.collectDiagnostics(outputDir);
+    }
+
+    @Test
+    void shaderSurvivesWindowResize() throws Exception {
+        Path outputDir = Path.of("build/test-artifacts/shaders/smoke/window-resize");
+        Files.createDirectories(outputDir);
+        client.loadTestWorld("shader-smoke-flat");
+        client.enableShader("glow-sphere");
+        client.resizeWindow(1280, 720);
+        client.waitForFrameBoundary("post-resize");
+        client.captureFrame(outputDir.resolve("frame.png"));
+        client.assertNoOpenGlErrors();
+        client.collectDiagnostics(outputDir);
+    }
+}
+
+interface SmokeClientHarness {
+    void loadTestWorld(String worldId);
+    void enableShader(String shaderId);
+    void reloadResources();
+    void resizeWindow(int width, int height);
+    void waitForFrameBoundary(String name);
+    void captureFrame(Path path);
+    void assertNoOpenGlErrors();
+    void collectDiagnostics(Path outputDir);
+
+    static SmokeClientHarness attachOrLaunch() {
+        throw new UnsupportedOperationException("Bind this to Fabric, Forge, NeoForge, or the project's runtime smoke harness");
+    }
+}

@@ -1,0 +1,29 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Path
+
+class ShaderProbeRecorder {
+
+    fun record(
+        scene: ShaderSceneManifest,
+        outputJson: Path,
+    ): ShaderProbeResult {
+        /*
+         * Record deterministic state that AI can combine with the captured images.
+         * Good examples:
+         * - sampled pixel values
+         * - effective uniform values
+         * - framebuffer attachment metadata
+         * - pass order
+         * - GL errors
+         */
+        TODO("Write probe JSON with sampled state and debug metadata")
+    }
+}
+
+data class ShaderProbeResult(
+    val sceneId: String,
+    val probeJsonPath: String,
+    val uniformSnapshot: Map<String, Any?>,
+    val glErrors: List<String>,
+)

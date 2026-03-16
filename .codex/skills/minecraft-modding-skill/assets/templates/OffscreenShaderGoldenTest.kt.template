@@ -1,0 +1,69 @@
+package {{package_name}}.graphics
+
+import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.extension.ExtendWith
+import java.nio.file.Files
+import java.nio.file.Path
+
+@Tag("gpu")
+@Tag("golden")
+@ExtendWith(ShaderTestExtension::class)
+class OffscreenShaderGoldenTest {
+
+    private val sceneRunner = ShaderSceneRunner()
+    private val debugCapture = ShaderDebugCapture()
+    private val comparator = ShaderBaselineComparator()
+    private val probeRecorder = ShaderProbeRecorder()
+    private val manifestWriter = ShaderCaptureManifestWriter()
+
+    @Test
+    fun `glow sphere composite emits AI-readable artifacts`(runtime: ShaderTestRuntime) {
+        val scene = ShaderSceneManifest.load(runtime.sceneRoot.resolve("glow-sphere.default.json"))
+        val outputDir = runtime.artifactRoot.resolve("glow-sphere/default")
+        Files.createDirectories(outputDir)
+
+        val actualImage = outputDir.resolve("actual.png")
+        val metadataJson = outputDir.resolve("metadata.json")
+        val probeJson = outputDir.resolve("probe.json")
+        val metricsJson = outputDir.resolve("metrics.json")
+        val diffImage = outputDir.resolve("diff.png")
+        val captureManifestJson = outputDir.resolve("capture-manifest.json")
+
+        val renderResult = sceneRunner.render(scene, runtime, actualImage)
+        sceneRunner.writeMetadata(renderResult, metadataJson)
+
+        val passCaptureResult = debugCapture.capturePassOutputs(
+            scene = scene,
+            outputDir = outputDir.resolve("passes"),
+        )
+
+        val probeResult = probeRecorder.record(
+            scene = scene,
+            outputJson = probeJson,
+        )
+
+        val compareResult = comparator.compareIfPresent(
+            scene = scene,
+            projectRoot = runtime.projectRoot,
+            actualImage = actualImage,
+            outputMetricsJson = metricsJson,
+            outputDiffImage = diffImage,
+        )
+
+        manifestWriter.write(
+            scene = scene,
+            renderResult = renderResult,
+            passCaptureResult = passCaptureResult,
+            probeResult = probeResult,
+            compareResult = compareResult,
+            outputJson = captureManifestJson,
+        )
+
+        if (compareResult != null) {
+            check(compareResult.matchesBaseline) {
+                "Baseline comparison failed. See $captureManifestJson for capture details."
+            }
+        }
+    }
+}

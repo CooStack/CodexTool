@@ -1,0 +1,16 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Path;
+import java.util.List;
+
+public final class ShaderDebugCapture {
+    public ShaderPassCaptureResult capturePassOutputs(ShaderSceneManifest scene, Path outputDir) {
+        throw new UnsupportedOperationException("Capture intermediate pass outputs and write them under outputDir");
+    }
+}
+
+record ShaderPassCaptureResult(
+    String sceneId,
+    List<String> passImagePaths,
+    List<String> attachmentImagePaths
+) {}

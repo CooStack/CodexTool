@@ -1,0 +1,17 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public final class ShaderCaptureCli {
+    public static void main(String[] args) throws Exception {
+        Path scenePath = Path.of(args.length > 0 ? args[0] : "");
+        if (args.length == 0) {
+            throw new IllegalArgumentException("Expected a scene manifest path");
+        }
+        Path projectRoot = Path.of("").toAbsolutePath();
+        Path artifactRoot = projectRoot.resolve("build/test-artifacts/shaders/cli");
+        Files.createDirectories(artifactRoot);
+        throw new UnsupportedOperationException("Load manifest, render scene, capture passes, record probes, compare baseline if present, write capture manifest");
+    }
+}

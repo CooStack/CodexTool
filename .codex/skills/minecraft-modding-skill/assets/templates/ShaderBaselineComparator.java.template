@@ -1,0 +1,27 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Path;
+
+public final class ShaderBaselineComparator {
+    public ShaderCompareResult compareIfPresent(
+        ShaderSceneManifest scene,
+        Path projectRoot,
+        Path actualImage,
+        Path outputMetricsJson,
+        Path outputDiffImage
+    ) {
+        if (scene.baseline() == null) {
+            return null;
+        }
+        throw new UnsupportedOperationException("Compare actualImage with baseline " + scene.baseline());
+    }
+}
+
+record ShaderCompareResult(
+    String sceneId,
+    boolean matchesBaseline,
+    double rmse,
+    int maxDiff,
+    double failingPixelsRatio,
+    double brightRegionShiftPx
+) {}

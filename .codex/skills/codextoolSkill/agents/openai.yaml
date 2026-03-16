@@ -1,0 +1,7 @@
+interface:
+  display_name: "CodexTool Skill"
+  short_description: "Use this for role-based multi-agent planning, review loops, and coordinated subagent execution."
+  default_prompt: "Use $codextoolSkill when the user explicitly asks for multiple agents, role-based collaboration, one agent reviewing another, or a coordinated team workflow. Also use it when a problem is complex enough that planner-worker-reviewer decomposition is warranted. Start by calling `agent_team_plan` to decide role layout and shared artifacts, then immediately call `agent_team_bootstrap` with `user_requested_mode=true` before workers begin writing code so the dashboard and run-scoped docs are created up front. Keep `open_dashboard=true` unless the user explicitly asks to suppress the GUI. After bootstrap, call `agent_team_script` to get coordinator instructions and reusable role prompt templates. Use a coordinator hub model: planner first, then one worker per independent module, reviewer after each round, and integrator when multiple workers exist. Do not rely on direct subagent-to-subagent chat; relay through the coordinator or shared artifacts. Require every agent to prefix each major output with its assigned identity prefix, such as `[planner]`, `[worker:frontend]`, or `[reviewer]`."
+
+policy:
+  allow_implicit_invocation: true

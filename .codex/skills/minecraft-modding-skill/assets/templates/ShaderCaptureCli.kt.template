@@ -1,0 +1,21 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Files
+import java.nio.file.Path
+
+object ShaderCaptureCli {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val scenePath = Path.of(args.firstOrNull() ?: error("Expected a scene manifest path"))
+        val projectRoot = Path.of("").toAbsolutePath()
+        val artifactRoot = projectRoot.resolve("build/test-artifacts/shaders/cli")
+        Files.createDirectories(artifactRoot)
+
+        /*
+         * Reuse the same helper classes as the JUnit path. This CLI exists only
+         * for batch runs or fast iteration loops; it should not diverge from the
+         * test implementation.
+         */
+        TODO("Load manifest, render scene, capture passes, record probes, compare baseline if present, write capture manifest")
+    }
+}

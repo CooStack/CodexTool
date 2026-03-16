@@ -1,0 +1,31 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Path
+
+class ShaderBaselineComparator {
+
+    fun compareIfPresent(
+        scene: ShaderSceneManifest,
+        projectRoot: Path,
+        actualImage: Path,
+        outputMetricsJson: Path,
+        outputDiffImage: Path,
+    ): ShaderCompareResult? {
+        val baseline = scene.baseline ?: return null
+
+        /*
+         * Load the expected image, compare it to actualImage, write metrics JSON
+         * and a diff image, then return a machine-readable result.
+         */
+        TODO("Compare actualImage with baseline $baseline")
+    }
+}
+
+data class ShaderCompareResult(
+    val sceneId: String,
+    val matchesBaseline: Boolean,
+    val rmse: Double,
+    val maxDiff: Int,
+    val failingPixelsRatio: Double,
+    val brightRegionShiftPx: Double,
+)

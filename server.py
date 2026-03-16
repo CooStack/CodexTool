@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import traceback
 import urllib.request
 import zipfile
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 from typing import Any, Callable, Optional, Tuple, Union
 
@@ -31,6 +32,34 @@ CAPABILITY_DIR = BASE_DIR / "capabilities"
 CAPABILITY_INDEX_PATH = CAPABILITY_DIR / "INDEX.md"
 CAPABILITY_DECLARATION_PATH = CAPABILITY_DIR / "declaration.json"
 CAPABILITY_RESOURCE_PREFIX = "codextools://capabilities"
+DEFAULT_TEXT_READ_MAX_CHARS = 4000
+DEFAULT_TEXTS_READ_MAX_CHARS_PER_FILE = 3000
+DEFAULT_TEXTS_READ_MAX_CHARS_TOTAL = 12000
+DEFAULT_SEARCH_MAX_MATCHES = 80
+DEFAULT_SEARCH_MAX_MATCHES_PER_FILE = 8
+DEFAULT_SEARCH_MAX_SKIPPED_FILES = 20
+DEFAULT_SEARCH_COMMON_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".idea",
+        ".vscode",
+        "dist",
+        "build",
+        "local_cache",
+    }
+)
+DEFAULT_PROC_STDOUT_MAX_CHARS = 4000
+DEFAULT_PROC_STDERR_MAX_CHARS = 4000
 
 
 def _log(msg: str) -> None:
@@ -930,6 +959,16 @@ def _apply_text_read_limits(
     }
 
 
+def _truncate_result_text(value: str, limit: int) -> tuple[str, bool]:
+    if limit <= 0:
+        return "", bool(value)
+    if len(value) <= limit:
+        return value, False
+    if limit <= 3:
+        return value[:limit], True
+    return value[: limit - 3] + "...", True
+
+
 def _is_probably_text_jar_entry(entry_name: str) -> bool:
     lower_name = entry_name.lower()
     return lower_name.endswith(_JAR_TEXT_FILE_SUFFIXES)
@@ -1471,7 +1510,7 @@ def tool_fs_read_text(args: dict[str, Any]) -> dict[str, Any]:
     start_line = args.get("start_line")
     end_line = args.get("end_line")
     max_lines = args.get("max_lines")
-    max_chars = args.get("max_chars")
+    max_chars = args.get("max_chars", DEFAULT_TEXT_READ_MAX_CHARS)
 
     path, inline_jar_entry = _split_jar_path_and_entry(raw_path)
     if inline_jar_entry is not None and jar_entry is not None:
@@ -1778,8 +1817,8 @@ def tool_fs_read_texts(args: dict[str, Any]) -> dict[str, Any]:
     start_line = args.get("start_line")
     end_line = args.get("end_line")
     max_lines_per_file = _as_int(args.get("max_lines_per_file"), 0, minimum=0)
-    max_chars_per_file = _as_int(args.get("max_chars_per_file"), 4000, minimum=0)
-    max_chars_total = _as_int(args.get("max_chars_total"), 20000, minimum=0)
+    max_chars_per_file = _as_int(args.get("max_chars_per_file"), DEFAULT_TEXTS_READ_MAX_CHARS_PER_FILE, minimum=0)
+    max_chars_total = _as_int(args.get("max_chars_total"), DEFAULT_TEXTS_READ_MAX_CHARS_TOTAL, minimum=0)
     max_files = _as_int(args.get("max_files"), len(requests), minimum=1)
     include_content = _as_bool(args.get("include_content"), True)
     stop_on_error = _as_bool(args.get("stop_on_error"), False)
@@ -2142,10 +2181,21 @@ def tool_fs_search_text(args: dict[str, Any]) -> dict[str, Any]:
     max_match_chars = _as_int(args.get("max_match_chars"), 120, minimum=0)
     max_files = _as_int(args.get("max_files"), 500, minimum=1)
     max_file_bytes = _as_int(args.get("max_file_bytes"), 2 * 1024 * 1024, minimum=0)
-    max_matches = _as_int(args.get("max_matches"), 200, minimum=1)
-    max_matches_per_file = _as_int(args.get("max_matches_per_file"), 20, minimum=1)
-    max_skipped_files = _as_int(args.get("max_skipped_files"), 100, minimum=0)
-    include_preview = _as_bool(args.get("include_preview"), True)
+    max_matches = _as_int(args.get("max_matches"), DEFAULT_SEARCH_MAX_MATCHES, minimum=1)
+    max_matches_per_file = _as_int(args.get("max_matches_per_file"), DEFAULT_SEARCH_MAX_MATCHES_PER_FILE, minimum=1)
+    max_skipped_files = _as_int(args.get("max_skipped_files"), DEFAULT_SEARCH_MAX_SKIPPED_FILES, minimum=0)
+    include_preview = _as_bool(args.get("include_preview"), False)
+    include_skipped_files = _as_bool(args.get("include_skipped_files"), False)
+    respect_common_ignores = _as_bool(args.get("respect_common_ignores"), True)
+    exclude_globs_arg = args.get("exclude_globs")
+    exclude_globs: list[str] = []
+    if exclude_globs_arg is not None:
+        if not isinstance(exclude_globs_arg, list):
+            raise ValueError("`exclude_globs` must be an array of strings")
+        for index, item in enumerate(exclude_globs_arg):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"`exclude_globs[{index}]` must be a non-empty string")
+            exclude_globs.append(item.strip())
 
     regex_flags = _parse_regex_flags(flags_text) if flags_text else 0
     if not case_sensitive:
@@ -2167,6 +2217,19 @@ def tool_fs_search_text(args: dict[str, Any]) -> dict[str, Any]:
     for child in iterator:
         if not child.is_file():
             continue
+        relative_path = child.relative_to(base)
+        relative_posix = relative_path.as_posix()
+        relative_parts = PurePosixPath(relative_posix).parts
+        if respect_common_ignores and any(part in DEFAULT_SEARCH_COMMON_EXCLUDED_DIRS for part in relative_parts[:-1]):
+            skipped_count += 1
+            if include_skipped_files and len(skipped_files) < max_skipped_files:
+                skipped_files.append({"path": str(child), "reason": "excluded by common ignore"})
+            continue
+        if exclude_globs and any(fnmatch.fnmatch(relative_posix, pattern_text) for pattern_text in exclude_globs):
+            skipped_count += 1
+            if include_skipped_files and len(skipped_files) < max_skipped_files:
+                skipped_files.append({"path": str(child), "reason": "excluded by exclude_globs"})
+            continue
         if files_scanned >= max_files:
             truncated = True
             break
@@ -2175,13 +2238,13 @@ def tool_fs_search_text(args: dict[str, Any]) -> dict[str, Any]:
         try:
             if max_file_bytes > 0 and child.stat().st_size > max_file_bytes:
                 skipped_count += 1
-                if len(skipped_files) < max_skipped_files:
+                if include_skipped_files and len(skipped_files) < max_skipped_files:
                     skipped_files.append({"path": str(child), "reason": "file too large"})
                 continue
             text = child.read_text(encoding=encoding, errors="replace")
         except Exception as e:
             skipped_count += 1
-            if len(skipped_files) < max_skipped_files:
+            if include_skipped_files and len(skipped_files) < max_skipped_files:
                 skipped_files.append({"path": str(child), "reason": f"{type(e).__name__}: {e}"})
             continue
 
@@ -2241,6 +2304,9 @@ def tool_fs_search_text(args: dict[str, Any]) -> dict[str, Any]:
         "max_matches": max_matches,
         "max_matches_per_file": max_matches_per_file,
         "max_file_bytes": max_file_bytes,
+        "include_preview": include_preview,
+        "include_skipped_files": include_skipped_files,
+        "respect_common_ignores": respect_common_ignores,
         "skipped_files_count": skipped_count,
         "skipped_files": skipped_files,
         "truncated": truncated,
@@ -2424,6 +2490,8 @@ def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
     shell_mode = _as_bool(args.get("shell"), False)
     command = _normalize_command(args["command"], shell_mode)
     timeout_sec = _as_int(args.get("timeout_sec"), 60, minimum=1, maximum=600)
+    max_stdout_chars = _as_int(args.get("max_stdout_chars"), DEFAULT_PROC_STDOUT_MAX_CHARS, minimum=0)
+    max_stderr_chars = _as_int(args.get("max_stderr_chars"), DEFAULT_PROC_STDERR_MAX_CHARS, minimum=0)
     cwd = args.get("cwd")
     cwd_path = _path(cwd) if isinstance(cwd, str) and cwd.strip() else None
 
@@ -2449,6 +2517,8 @@ def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
             shell=shell_mode,
             env=run_env,
         )
+        stdout, stdout_truncated = _truncate_result_text(completed.stdout, max_stdout_chars)
+        stderr, stderr_truncated = _truncate_result_text(completed.stderr, max_stderr_chars)
         return {
             "command": command,
             "shell": shell_mode,
@@ -2457,12 +2527,18 @@ def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
             "timed_out": False,
             "duration_ms": int((time.time() - started) * 1000),
             "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_length": len(completed.stdout),
+            "stderr_length": len(completed.stderr),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }
     except subprocess.TimeoutExpired as e:
-        stdout = e.stdout if isinstance(e.stdout, str) else ""
-        stderr = e.stderr if isinstance(e.stderr, str) else ""
+        raw_stdout = e.stdout if isinstance(e.stdout, str) else ""
+        raw_stderr = e.stderr if isinstance(e.stderr, str) else ""
+        stdout, stdout_truncated = _truncate_result_text(raw_stdout, max_stdout_chars)
+        stderr, stderr_truncated = _truncate_result_text(raw_stderr, max_stderr_chars)
         return {
             "command": command,
             "shell": shell_mode,
@@ -2473,6 +2549,10 @@ def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
             "returncode": None,
             "stdout": stdout,
             "stderr": stderr,
+            "stdout_length": len(raw_stdout),
+            "stderr_length": len(raw_stderr),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }
     except FileNotFoundError as e:
         return {
@@ -2485,6 +2565,10 @@ def _run_proc_command(args: dict[str, Any]) -> dict[str, Any]:
             "returncode": -1,
             "stdout": "",
             "stderr": f"FileNotFoundError: {e}. Try shell=true or use full path.",
+            "stdout_length": 0,
+            "stderr_length": len(f"FileNotFoundError: {e}. Try shell=true or use full path."),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
         }
 
 
@@ -2691,15 +2775,15 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "fs_patch_lines": "Replace or insert a line range in a UTF-8 text file.",
     "fs_list": "List files and directories matching a glob pattern.",
     "fs_list_files": "List files matching a glob pattern.",
-    "fs_search_text": "Search text in multiple files with batch queries and capped match/snippet output.",
+    "fs_search_text": "Search text in multiple files with compact defaults, optional previews, and common-noise excludes.",
     "fs_stat": "Get file/directory metadata: existence, size, timestamps.",
     "fs_delete": "Delete a file or directory. Use recursive=true for non-empty dirs.",
     "fs_move": "Move or copy a file/directory. Set copy=true to copy instead of move.",
     "fs_move_file": "Move a single file from source to destination.",
     "fs_copy_file": "Copy a single file from source to destination.",
     "fs_create": "Create a file or directory. Use kind=file|dir.",
-    "proc_run": "Execute a shell command and capture UTF-8 stdout/stderr. Requires `reason` and blocks shell/file-text operations that should use fs tools.",
-    "proc_run_batch": "Execute multiple shell commands sequentially and capture UTF-8 stdout/stderr for each result. Applies the same policy restrictions as `proc_run`.",
+    "proc_run": "Execute a shell command and capture capped UTF-8 stdout/stderr. Requires `reason` and blocks shell/file-text operations that should use fs tools.",
+    "proc_run_batch": "Execute multiple shell commands sequentially and capture capped UTF-8 stdout/stderr for each result. Applies the same policy restrictions as `proc_run`.",
     "img_draw": "Draw an image with primitive shapes (line, rect, ellipse, text, polygon). Requires Pillow.",
     "sound_beep": "Play a beep notification sound.",
 }
@@ -2714,7 +2798,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
             "max_lines": {"type": "integer", "minimum": 1},
-            "max_chars": {"type": "integer", "minimum": 0},
+            "max_chars": {"type": "integer", "minimum": 0, "default": DEFAULT_TEXT_READ_MAX_CHARS},
             "jar_entry": {"type": "string", "description": "Entry path inside .jar. Optional when using `path` syntax `archive.jar!/entry`."},
             "binary_encoding": {"type": "string", "enum": ["base64", "hex"], "default": "base64", "description": "Encoding used when returning binary entry data such as .class."},
             "class_mode": {"type": "string", "enum": ["bytecode", "methods", "source"], "default": "bytecode", "description": "How to read .class targets: raw bytecode encoding, parsed method signatures, or source-first lookup with Java decompile fallback."},
@@ -2758,8 +2842,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
             "max_lines_per_file": {"type": "integer", "minimum": 0, "default": 0},
-            "max_chars_per_file": {"type": "integer", "minimum": 0, "default": 4000},
-            "max_chars_total": {"type": "integer", "minimum": 0, "default": 20000},
+            "max_chars_per_file": {"type": "integer", "minimum": 0, "default": DEFAULT_TEXTS_READ_MAX_CHARS_PER_FILE},
+            "max_chars_total": {"type": "integer", "minimum": 0, "default": DEFAULT_TEXTS_READ_MAX_CHARS_TOTAL},
             "max_files": {"type": "integer", "minimum": 1},
             "include_content": {"type": "boolean", "default": True},
             "stop_on_error": {"type": "boolean", "default": False}
@@ -2854,10 +2938,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "max_match_chars": {"type": "integer", "minimum": 0, "default": 120},
             "max_files": {"type": "integer", "minimum": 1, "default": 500},
             "max_file_bytes": {"type": "integer", "minimum": 0, "default": 2097152},
-            "max_matches": {"type": "integer", "minimum": 1, "default": 200},
-            "max_matches_per_file": {"type": "integer", "minimum": 1, "default": 20},
-            "max_skipped_files": {"type": "integer", "minimum": 0, "default": 100},
-            "include_preview": {"type": "boolean", "default": True},
+            "max_matches": {"type": "integer", "minimum": 1, "default": DEFAULT_SEARCH_MAX_MATCHES},
+            "max_matches_per_file": {"type": "integer", "minimum": 1, "default": DEFAULT_SEARCH_MAX_MATCHES_PER_FILE},
+            "max_skipped_files": {"type": "integer", "minimum": 0, "default": DEFAULT_SEARCH_MAX_SKIPPED_FILES},
+            "include_preview": {"type": "boolean", "default": False},
+            "include_skipped_files": {"type": "boolean", "default": False},
+            "respect_common_ignores": {"type": "boolean", "default": True},
+            "exclude_globs": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["path"],
         "additionalProperties": False,
@@ -2932,6 +3019,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
             "shell": {"type": "boolean", "default": False},
             "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables to set"},
+            "max_stdout_chars": {"type": "integer", "minimum": 0, "default": DEFAULT_PROC_STDOUT_MAX_CHARS},
+            "max_stderr_chars": {"type": "integer", "minimum": 0, "default": DEFAULT_PROC_STDERR_MAX_CHARS},
         },
         "required": ["command", "reason"],
         "additionalProperties": False,
@@ -2950,6 +3039,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
                         "shell": {"type": "boolean", "default": False},
                         "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables to set"},
+                        "max_stdout_chars": {"type": "integer", "minimum": 0, "default": DEFAULT_PROC_STDOUT_MAX_CHARS},
+                        "max_stderr_chars": {"type": "integer", "minimum": 0, "default": DEFAULT_PROC_STDERR_MAX_CHARS},
                     },
                     "required": ["command"],
                     "additionalProperties": False,

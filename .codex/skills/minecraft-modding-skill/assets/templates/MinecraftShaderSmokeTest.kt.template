@@ -1,0 +1,64 @@
+package {{package_name}}.graphics
+
+import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
+import java.nio.file.Files
+import java.nio.file.Path
+
+@Tag("smoke")
+class MinecraftShaderSmokeTest {
+
+    private val client = SmokeClientHarness.attachOrLaunch()
+
+    @Test
+    fun `shader survives resource reload in world pass`() {
+        val outputDir = Path.of("build/test-artifacts/shaders/smoke/world-pass-reload")
+        Files.createDirectories(outputDir)
+
+        client.loadTestWorld("shader-smoke-flat")
+        client.enableShader("glow-sphere")
+        client.reloadResources()
+        client.waitForFrameBoundary("world-pass")
+        client.captureFrame(outputDir.resolve("frame.png"))
+        client.assertNoOpenGlErrors()
+        client.collectDiagnostics(outputDir)
+    }
+
+    @Test
+    fun `shader survives window resize`() {
+        val outputDir = Path.of("build/test-artifacts/shaders/smoke/window-resize")
+        Files.createDirectories(outputDir)
+
+        client.loadTestWorld("shader-smoke-flat")
+        client.enableShader("glow-sphere")
+        client.resizeWindow(width = 1280, height = 720)
+        client.waitForFrameBoundary("post-resize")
+        client.captureFrame(outputDir.resolve("frame.png"))
+        client.assertNoOpenGlErrors()
+        client.collectDiagnostics(outputDir)
+    }
+}
+
+/**
+ * Replace this abstraction with the project's real client automation or debug harness.
+ *
+ * If the target mod already has a runtime test harness, adapt that instead of creating
+ * a second parallel smoke system. In a CooParticlesAPI-style project, this can map to
+ * TestManager plus project-local TestGroup or TestOption orchestration.
+ */
+interface SmokeClientHarness {
+    fun loadTestWorld(worldId: String)
+    fun enableShader(shaderId: String)
+    fun reloadResources()
+    fun resizeWindow(width: Int, height: Int)
+    fun waitForFrameBoundary(name: String)
+    fun captureFrame(path: Path)
+    fun assertNoOpenGlErrors()
+    fun collectDiagnostics(outputDir: Path)
+
+    companion object {
+        fun attachOrLaunch(): SmokeClientHarness {
+            TODO("Bind this to Fabric, Forge, NeoForge, or the project's runtime smoke harness")
+        }
+    }
+}

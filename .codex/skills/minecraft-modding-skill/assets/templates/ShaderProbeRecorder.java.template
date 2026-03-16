@@ -1,0 +1,18 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+
+public final class ShaderProbeRecorder {
+    public ShaderProbeResult record(ShaderSceneManifest scene, Path outputJson) {
+        throw new UnsupportedOperationException("Write probe JSON with sampled state and debug metadata");
+    }
+}
+
+record ShaderProbeResult(
+    String sceneId,
+    String probeJsonPath,
+    Map<String, Object> uniformSnapshot,
+    List<String> glErrors
+) {}

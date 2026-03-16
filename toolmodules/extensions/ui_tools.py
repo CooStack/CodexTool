@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .agent_team_dashboard import DEFAULT_POLL_INTERVAL_MS, ensure_dashboard_state_exists, launch_dashboard_process, resolve_dashboard_state_path
 from .common import as_bool, as_int, install_package_with_pip, require_str
 
 _TK_ENV_LOCK = threading.RLock()
@@ -599,6 +600,39 @@ def tool_ui_line_chart(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_ui_agent_team_dashboard(args: dict[str, Any]) -> dict[str, Any]:
+    state_path = resolve_dashboard_state_path(
+        state_path=args.get("state_path"),
+        workspace_root=args.get("workspace_root"),
+    )
+    ensure_result = ensure_dashboard_state_exists(
+        state_path,
+        workspace_root=Path(str(args.get("workspace_root")).strip()).expanduser().resolve() if str(args.get("workspace_root") or "").strip() else None,
+        request=str(args.get("request") or "").strip(),
+        constraints=args.get("constraints") if isinstance(args.get("constraints"), list) else None,
+        roles=args.get("roles") if isinstance(args.get("roles"), list) else None,
+        title=str(args.get("title") or "").strip() or None,
+        poll_interval_ms=as_int(args.get("poll_interval_ms"), DEFAULT_POLL_INTERVAL_MS, minimum=250, maximum=60000) if args.get("poll_interval_ms") is not None else None,
+        active_run_id=str(args.get("active_run_id") or "").strip() or None,
+        auto_open=False,
+    )
+
+    launch = launch_dashboard_process(
+        state_path,
+        python_executable=str(args.get("python_executable") or "").strip() or None,
+        title=str(args.get("title") or "").strip() or None,
+        topmost=as_bool(args.get("topmost"), True),
+        bring_to_front=as_bool(args.get("bring_to_front"), True),
+        poll_interval_ms=args.get("poll_interval_ms"),
+    )
+    return {
+        "type": "agent_team_dashboard",
+        "created_state": bool(ensure_result.get("created")),
+        "runtime_files": ensure_result.get("runtime_files"),
+        **launch,
+    }
+
+
 def get_ui_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dict[str, Any]]]:
     handlers = {
         "ui_prompt": tool_ui_prompt,
@@ -607,6 +641,7 @@ def get_ui_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dict[str
         "ui_dialog_input": tool_ui_dialog_input,
         "ui_plan_confirm": tool_ui_plan_confirm,
         "ui_line_chart": tool_ui_line_chart,
+        "ui_agent_team_dashboard": tool_ui_agent_team_dashboard,
     }
     descriptions = {
         "ui_prompt": "Build a structured interactive prompt payload.",
@@ -615,6 +650,7 @@ def get_ui_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dict[str
         "ui_dialog_input": "Show a real input dialog with two buttons and return text plus clicked button.",
         "ui_plan_confirm": "Show a plan review dialog and return continue/modify decision.",
         "ui_line_chart": "Render a line chart to PNG and optionally display it in a window.",
+        "ui_agent_team_dashboard": "Open the agent team dashboard window from a dashboard `state_path`; `workspace_root` remains supported for compatibility.",
     }
     schemas = {
         "ui_prompt": {
@@ -708,6 +744,64 @@ def get_ui_tooling() -> tuple[dict[str, Any], dict[str, str], dict[str, dict[str
                 "path": {"type": "string"}
             },
             "required": ["y"],
+            "additionalProperties": False,
+        },
+        "ui_agent_team_dashboard": {
+            "type": "object",
+            "properties": {
+                "workspace_root": {
+                    "type": "string",
+                    "description": "Compatibility fallback for resolving `docs/agent-team/dashboard-state.json`.",
+                },
+                "state_path": {
+                    "type": "string",
+                    "description": "Preferred dashboard state file path, typically `dashboard.state_path` from `agent_team_bootstrap`.",
+                },
+                "request": {
+                    "type": "string",
+                    "description": "When the dashboard state file does not exist yet, seed the generated state with this request text.",
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional constraint list used when auto-generating a missing dashboard state file.",
+                },
+                "roles": {
+                    "type": "array",
+                    "description": "Optional role specs used when auto-generating a missing dashboard state file. Items may be strings or objects with `role_id`, `title`, `persona_hint`, and `output_prefix`.",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "role_id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "persona_hint": {"type": "string"},
+                                    "output_prefix": {"type": "string"},
+                                    "status": {"type": "string"},
+                                    "latest_message": {"type": "string"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        ]
+                    },
+                },
+                "active_run_id": {
+                    "type": "string",
+                    "description": "Optional run id to store in a newly generated dashboard state file.",
+                },
+                "python_executable": {"type": "string"},
+                "title": {"type": "string"},
+                "topmost": {"type": "boolean", "default": True},
+                "bring_to_front": {"type": "boolean", "default": True},
+                "poll_interval_ms": {"type": "integer", "minimum": 250, "maximum": 60000},
+            },
+            "required": [],
+            "anyOf": [
+                {"required": ["state_path"]},
+                {"required": ["workspace_root"]},
+            ],
             "additionalProperties": False,
         },
     }

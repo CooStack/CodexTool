@@ -41,7 +41,7 @@ def install_package_with_pip(package_name: str, feature_name: str) -> None:
     package = package_name.strip()
     feature = feature_name.strip() or package
     if not package:
-        raise ValueError("`package_name` must be a non-empty string")
+        raise ValueError("`package_name` must be a non-empty string")   
 
     with _AUTO_INSTALL_LOCK:
         if package in _AUTO_INSTALL_ATTEMPTS:

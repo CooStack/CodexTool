@@ -1,0 +1,16 @@
+package {{package_name}}.graphics;
+
+import java.nio.file.Path;
+
+public final class ShaderCaptureManifestWriter {
+    public void write(
+        ShaderSceneManifest scene,
+        ShaderRenderResult renderResult,
+        ShaderPassCaptureResult passCaptureResult,
+        ShaderProbeResult probeResult,
+        ShaderCompareResult compareResult,
+        Path outputJson
+    ) {
+        throw new UnsupportedOperationException("Write capture-manifest.json");
+    }
+}

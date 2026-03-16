@@ -1,0 +1,7 @@
+interface:
+  display_name: "Minecraft Modding Skill"
+  short_description: "Use this first for Minecraft mod development, mod API integration, and Minecraft render or shader work."
+  default_prompt: "Use $minecraft-modding-skill whenever the project or request indicates Minecraft modding. Treat this as triggered if Gradle files contain Minecraft-related dependencies or plugins, if source imports include net.minecraft or common loader namespaces, or if the user explicitly says the task is Minecraft, Forge, Fabric, or NeoForge mod development. As soon as the project is confirmed to be Minecraft-related, reply exactly once with `我已知道这是一个MC项目`, then continue implementing the user's request. Read the skill and follow its rules before coding. Enforce a shared static MOD_ID constant in the main mod class, verify loader, mappings, and Minecraft version from actual project dependencies and jars instead of guessing, and when integrating another mod's API, first produce a short requirements and integration plan and build a focused knowledge base from the exact dependency version, local jars, sources, docs, or GitHub before implementation. Also use this skill for Minecraft-adjacent shader, framebuffer, RenderEntity, or visual regression work."
+
+policy:
+  allow_implicit_invocation: true

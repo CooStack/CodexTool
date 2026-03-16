@@ -1,0 +1,12 @@
+# Coordinator Loop
+
+1. Call `agent_team_plan`.
+2. If needed, suggest multi-agent mode to the user.
+3. When enabled, call `agent_team_bootstrap`.
+4. Call `agent_team_script`.
+5. Spawn planner first.
+6. Spawn one worker per independent module.
+7. After each worker round, run reviewer.
+8. Relay findings back to the owning worker.
+9. When workers converge, run integrator if multiple workers exist.
+10. Deliver final result to the user.

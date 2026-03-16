@@ -1,0 +1,73 @@
+package {{package_name}}.graphics;
+
+import org.junit.jupiter.api.extension.AfterAllCallback;
+import org.junit.jupiter.api.extension.BeforeAllCallback;
+import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.ParameterContext;
+import org.junit.jupiter.api.extension.ParameterResolver;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public final class ShaderTestExtension implements BeforeAllCallback, AfterAllCallback, ParameterResolver {
+    private ShaderTestRuntime runtime;
+
+    @Override
+    public void beforeAll(ExtensionContext context) throws Exception {
+        Path projectRoot = Path.of("").toAbsolutePath();
+        Path artifactRoot = projectRoot.resolve("build/test-artifacts/shaders");
+        Files.createDirectories(artifactRoot);
+        runtime = new ShaderTestRuntime(
+            projectRoot,
+            artifactRoot,
+            projectRoot.resolve("src/test/resources/shader-baselines"),
+            projectRoot.resolve("src/test/resources/shader-scenes"),
+            createHiddenContext(),
+            queryGlVersion(),
+            queryDriverString()
+        );
+    }
+
+    @Override
+    public void afterAll(ExtensionContext context) {
+        if (runtime != null) {
+            destroyHiddenContext(runtime.contextHandle());
+        }
+    }
+
+    @Override
+    public boolean supportsParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
+        return parameterContext.getParameter().getType() == ShaderTestRuntime.class;
+    }
+
+    @Override
+    public Object resolveParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
+        return runtime;
+    }
+
+    private long createHiddenContext() {
+        throw new UnsupportedOperationException("Create a hidden GLFW or LWJGL OpenGL context here");
+    }
+
+    private void destroyHiddenContext(long handle) {
+        throw new UnsupportedOperationException("Destroy the hidden OpenGL context here");
+    }
+
+    private String queryGlVersion() {
+        throw new UnsupportedOperationException("Read GL_VERSION from the active context");
+    }
+
+    private String queryDriverString() {
+        throw new UnsupportedOperationException("Read GL_VENDOR and GL_RENDERER from the active context");
+    }
+}
+
+record ShaderTestRuntime(
+    Path projectRoot,
+    Path artifactRoot,
+    Path baselineRoot,
+    Path sceneRoot,
+    long contextHandle,
+    String glVersion,
+    String driverString
+) {}

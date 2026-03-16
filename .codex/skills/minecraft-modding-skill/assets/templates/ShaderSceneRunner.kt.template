@@ -1,0 +1,48 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Path
+
+class ShaderSceneRunner {
+
+    fun render(
+        scene: ShaderSceneManifest,
+        runtime: ShaderTestRuntime,
+        outputImage: Path,
+    ): ShaderRenderResult {
+        /*
+         * Replace this with project-local rendering that directly uses the
+         * standalone shader API. In a CooParticlesAPI-style project this is where
+         * you exercise CooShaderProgram, GlShader, GlFrameBuffer, VertexBuffer,
+         * GlTexture, ShaderPipe, and PipeLinker.
+         *
+         * Do not depend on Minecraft.getInstance() or mainRenderTarget here.
+         */
+        TODO("Render the manifest scene and write outputImage")
+    }
+
+    fun writeMetadata(result: ShaderRenderResult, outputJson: Path) {
+        TODO("Serialize result metadata to JSON")
+    }
+}
+
+data class ShaderRenderResult(
+    val sceneId: String,
+    val pipelineVariant: String,
+    val glVersion: String,
+    val driver: String,
+    val viewportWidth: Int,
+    val viewportHeight: Int,
+    val actualImagePath: String,
+)
+
+data class ShaderSceneManifest(
+    val sceneId: String,
+    val pipelineVariant: String,
+    val baseline: String?,
+) {
+    companion object {
+        fun load(path: Path): ShaderSceneManifest {
+            TODO("Load and validate the scene manifest JSON")
+        }
+    }
+}

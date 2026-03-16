@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Union
 
+from .extensions.agent_orchestration_tools import get_agent_orchestration_tooling
 from .extensions.browser_tools import get_browser_tooling
 from .extensions.computer_use_tools import get_computer_use_tooling
 from .extensions.debug_tools import get_debug_tooling
@@ -39,6 +40,7 @@ def get_extension_tooling() -> tuple[
     schemas: dict[str, dict[str, Any]] = {}
 
     for provider in (
+        get_agent_orchestration_tooling,
         get_debug_tooling,
         get_perf_tooling,
         get_ui_tooling,

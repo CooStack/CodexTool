@@ -1,0 +1,27 @@
+package {{package_name}}.graphics
+
+import java.nio.file.Path
+
+class ShaderDebugCapture {
+
+    fun capturePassOutputs(
+        scene: ShaderSceneManifest,
+        outputDir: Path,
+    ): ShaderPassCaptureResult {
+        /*
+         * Export deterministic debug artifacts that AI can inspect directly.
+         * Good examples:
+         * - one PNG per ShaderPipe stage
+         * - one PNG per MRT color attachment
+         * - optional depth visualization
+         * - optional debug views controlled by a uniform or compile flag
+         */
+        TODO("Capture intermediate pass outputs and write them under outputDir")
+    }
+}
+
+data class ShaderPassCaptureResult(
+    val sceneId: String,
+    val passImagePaths: List<String>,
+    val attachmentImagePaths: List<String>,
+)
